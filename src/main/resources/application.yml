@@ -1,0 +1,60 @@
+# 服务器配置
+server:
+  port: 8123  # 服务端口号
+  servlet:
+    context-path: /api  # 应用的上下文路径，所有请求会加上/api 前缀
+
+# Spring 配置
+spring:
+  application:
+    name: yun-picture-backend  # 应用名称
+
+  # 数据库配置
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver  # MySQL 驱动类
+    url: jdbc:mysql://localhost:3306/yun_picture  # 数据库连接地址（数据库名：yun_picture）
+    username: root  # 数据库用户名
+    password: ${YUN_PICTURE_DB_PASSWORD}  # 数据库密码，从环境变量读取，避免提交明文密码
+
+# MyBatis-Plus 框架配置（MyBatis 增强工具，简化 CRUD）
+mybatis-plus:
+  # MyBatis 原生配置
+  configuration:
+    # 下划线转驼峰命名转换
+    # true: user_name → userName | false: 不转换
+    map-underscore-to-camel-case: false
+    # SQL 执行日志输出（控制台打印 SQL 语句，便于调试）
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  # MyBatis-Plus 全局配置
+  global-config:
+    # 数据库配置
+    db-config:
+      # 逻辑删除字段名（删除时不真正删除数据，只标记状态）
+      logic-delete-field: isDelete
+      # 逻辑删除值（已删除状态）
+      logic-delete-value: 1
+      # 逻辑未删除值（正常状态，查询时自动添加 is_delete = 0 条件）
+      logic-not-delete-value: 0
+
+
+# 接口文档配置 (Knife4j 全局配置)
+knife4j:
+  # 是否开启 Knife4j 的增强模式和 UI 界面
+  enable: true
+  openapi:
+    # 接口文档的显示标题
+    title: "接口文档"
+    # 接口文档的版本号
+    version: 1.0
+    # 接口分组配置（可以在此配置多个不同的分组展示）
+    group:
+      # 分组的名称，此处定义了一个名为 "default" 的默认分组
+      default:
+        group-name: 默认分组
+        # API 的扫描/匹配规则，"package" 表示基于包路径进行扫描
+        api-rule: package
+        # 配置具体的扫描资源（与 api-rule 配合使用）
+        api-rule-resources:
+          # 指定具体的 Controller 包路径，该包下的所有接口都会被扫描并生成到 default 分组中
+          - org.example.yunpicturebackend.controller
+
