@@ -1,12 +1,16 @@
 package org.example.yunpicturebackend.service;
 
-import org.example.yunpicturebackend.model.dto.UserLoginRequest;
-import org.example.yunpicturebackend.model.dto.UserRegisterRequest;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import org.example.yunpicturebackend.model.dto.user.UserLoginRequest;
+import org.example.yunpicturebackend.model.dto.user.UserQueryRequest;
+import org.example.yunpicturebackend.model.dto.user.UserRegisterRequest;
 import org.example.yunpicturebackend.model.entity.User;
 import com.baomidou.mybatisplus.extension.service.IService;
 import org.example.yunpicturebackend.model.vo.LoginUserVO;
+import org.example.yunpicturebackend.model.vo.UserVO;
 
 import javax.servlet.http.HttpServletRequest;
+import java.util.List;
 
 /**
 * @author 24042
@@ -88,4 +92,43 @@ public interface UserService extends IService<User> {
      * @return 注销操作是否成功（通常只要没有发生系统异常，都应返回 true，且设计上建议保持幂等性，即多次点击注销不报错）
      */
     boolean userLogout(HttpServletRequest request);
+
+
+    /**
+     * 获取脱敏后的用户信息 (单体转换)
+     * <p>
+     * 【方法契约】
+     * 将包含底层敏感数据（如密码、盐值等）的 User 数据库实体对象，
+     * 转换为专门用于前端安全展示的 UserVO 视图对象。
+     *
+     * @param user 原始用户实体对象（从数据库中查询得出）
+     * @return 经过脱敏处理的用户视图对象 (VO)；若传入的 user 为 null，则应返回 null
+     */
+    UserVO getUserVO(User user);
+
+    /**
+     * 批量获取脱敏后的用户信息列表 (批量转换)
+     * <p>
+     * 【业务场景】
+     * 常搭配分页查询接口使用。将数据库中查出的一批 User 实体集合，
+     * 统一转换为安全的 UserVO 集合后下发给前端。
+     *
+     * @param userList 原始用户实体对象列表
+     * @return 经过脱敏处理的用户视图对象 (VO) 列表；若传入的集合为空，应保证返回一个空集合（而非 null），避免前端报空指针异常
+     */
+    List<UserVO> getUserVoList(List<User> userList);
+
+
+    /**
+     * 获取用户查询条件封装器 (QueryWrapper)
+     * <p>
+     * 【方法契约】
+     * 将前端传来的多维查询参数 (UserQueryRequest)，转化为 MyBatis Plus 能直接识别的条件封装器。
+     * 通常配合底层的 mapper.selectPage() 或 mapper.selectList() 方法使用。
+     *
+     * @param userQueryRequest 用户查询请求参数 DTO（包含分页、筛选、排序参数）
+     * @return 包含动态 SQL 条件的 MyBatis Plus 查询封装器
+     */
+    QueryWrapper<User> getQueryWrapper(UserQueryRequest userQueryRequest);
+
 }

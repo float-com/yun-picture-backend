@@ -1,4 +1,4 @@
-package org.example.yunpicturebackend.model.dto;
+package org.example.yunpicturebackend.model.dto.user;
 
 import lombok.Data;
 import java.io.Serializable;

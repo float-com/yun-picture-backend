@@ -1,23 +1,32 @@
 package org.example.yunpicturebackend.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.collection.CollUtil;
+import cn.hutool.core.util.ObjUtil;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import lombok.extern.slf4j.Slf4j;
-import org.example.yunpicturebackend.model.dto.UserLoginRequest;
-import org.example.yunpicturebackend.model.dto.UserRegisterRequest;
+import org.example.yunpicturebackend.model.dto.user.UserLoginRequest;
+import org.example.yunpicturebackend.model.dto.user.UserQueryRequest;
+import org.example.yunpicturebackend.model.dto.user.UserRegisterRequest;
 import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.model.entity.User;
 import org.example.yunpicturebackend.model.enums.UserRoleEnum;
 import org.example.yunpicturebackend.model.vo.LoginUserVO;
+import org.example.yunpicturebackend.model.vo.UserVO;
 import org.example.yunpicturebackend.service.UserService;
 import org.example.yunpicturebackend.mapper.UserMapper;
+import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
 
 import javax.servlet.http.HttpServletRequest;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
 
 import static org.example.yunpicturebackend.constant.UserConstant.USER_LOGIN_STATE;
 
@@ -317,6 +326,114 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User>
 
         return true;
     }
+
+    /**
+     * 获得脱敏后的用户信息
+     * <p>
+     * 【设计原理】
+     * 这是核心的数据脱敏处理节点。通过将数据库实体类 (Entity) 的属性复制到视图类 (VO) 中，
+     * 由于 VO 中本身没有定义 password、salt 等敏感字段，所以在拷贝过程中这些敏感数据自然就被丢弃过滤了。
+     *
+     * @param user 数据库中的完整用户实体对象
+     * @return 经过脱敏和格式化处理的 UserVO 对象；如果传入的对象为 null，则安全返回 null
+     */
+    @Override
+    public UserVO getUserVO(User user) {
+        // 1. 防御性编程：判空拦截，防止后续调用引发 NullPointerException
+        if (user == null) {
+            return null;
+        }
+
+        // 2. 初始化目标视图对象
+        UserVO userVO = new UserVO();
+
+        // 3. 属性拷贝：使用框架提供的工具类（如 Spring 的 BeanUtils）
+        // 它会通过反射机制，将源对象 (user) 中与目标对象 (userVO) 同名同类型的属性值浅拷贝过去。
+        BeanUtils.copyProperties(user, userVO);
+
+        return userVO;
+    }
+
+    /**
+     * 获得脱敏后的用户信息列表
+     * <p>
+     * 【业务场景】
+     * 极常用于“分页查询用户列表”或“批量获取用户信息”的接口中。
+     * * @param userList 数据库查询出来的完整用户实体集合
+     * @return 转换后的 UserVO 集合；若入参为空，则默认返回空集合，避免前端接收到 null 时崩溃
+     */
+    @Override
+    public List<UserVO> getUserVoList(List<User> userList) {
+        // 1. 防御性拦截：借助 Hutool 工具类判断集合是否为 null 或 size == 0
+        if (CollUtil.isEmpty(userList)) {
+            // 良好的 API 实践：返回一个空的 ArrayList 而不是 null，对前端解析更加友好
+            return new ArrayList<>();
+        }
+
+        // 2. 核心转换逻辑：利用 Java 8 Stream API 进行链式处理
+        return userList.stream()
+                // .map(): 数据映射。遍历流中的每一个 User 对象，将其作为参数传递给本类的 getUserVO 方法。
+                // (this::getUserVo) 是方法引用的简写，等同于 user -> this.getUserVO(user)
+                .map(this::getUserVO)
+                // .collect(): 将流中处理完毕的所有 UserVO 对象重新收集并打包成一个 List 集合
+                .collect(Collectors.toList());
+    }
+
+
+
+
+
+
+    /**
+     * 获取用户查询条件封装器 (QueryWrapper) 具体实现
+     * <p>
+     * 【设计原理】
+     * 基于 MyBatis Plus 提供的 QueryWrapper 实现按需动态拼接 SQL。
+     * 针对不同类型的字段采用严格分类的匹配策略：
+     * 1. 精确匹配 (eq)：主键 (id)、状态/枚举值 (userRole)。
+     * 2. 模糊匹配 (like)：用户输入的文本类信息 (userAccount, userName, userProfile)。
+     * 3. 动态排序 (orderBy)：根据前端指定的字段和顺序 (升序/降序) 进行排序。
+     *
+     * @param userQueryRequest 包含各项筛选条件的请求参数
+     * @return 组装完毕的 QueryWrapper 对象
+     * @throws BusinessException 若请求参数为空，触发防御性拦截并抛出异常
+     */
+    @Override
+    public QueryWrapper<User> getQueryWrapper(UserQueryRequest userQueryRequest) {
+        // 1. 防御性编程：防止上游调用方传入 null 导致后续的空指针异常
+        if (userQueryRequest == null) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "请求参数为空");
+        }
+
+        // 2. 参数解构：将 DTO 中的查询条件提取出来
+        Long id = userQueryRequest.getId();
+        String userAccount = userQueryRequest.getUserAccount();
+        String userName = userQueryRequest.getUserName();
+        String userProfile = userQueryRequest.getUserProfile();
+        String userRole = userQueryRequest.getUserRole();
+        String sortField = userQueryRequest.getSortField();
+        String sortOrder = userQueryRequest.getSortOrder();
+
+        // 3. 初始化 QueryWrapper
+        QueryWrapper<User> queryWrapper = new QueryWrapper<>();
+
+        // 4. 动态 SQL 拼接：第一个参数为 true 时，该条件才会加入到最终的 SQL 中
+        // 【精确查询】主键和角色属于强关联标识，必须精确匹配 (SQL: id = ? AND userRole = ?)
+        queryWrapper.eq(ObjUtil.isNotNull(id), "id", id);
+        queryWrapper.eq(StrUtil.isNotBlank(userRole), "userRole", userRole);
+
+        // 【模糊查询】文本类字段支持关键字搜索 (SQL: userAccount LIKE '%?%')
+        queryWrapper.like(StrUtil.isNotBlank(userAccount), "userAccount", userAccount);
+        queryWrapper.like(StrUtil.isNotBlank(userName), "userName", userName);
+        queryWrapper.like(StrUtil.isNotBlank(userProfile), "userProfile", userProfile);
+
+        // 5. 排序规则拼接
+        // 判断 sortField 是否存在，若存在则根据 sortOrder 决定是 ASC 还是 DESC
+        queryWrapper.orderBy(StrUtil.isNotEmpty(sortField), sortOrder.equals("ascend"), sortField);
+
+        return queryWrapper;
+    }
+
 }
 
 

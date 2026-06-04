@@ -1,18 +1,25 @@
 package org.example.yunpicturebackend.controller;
 
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import org.example.yunpicturebackend.annotation.AuthCheck;
 import org.example.yunpicturebackend.common.BaseResponse;
+import org.example.yunpicturebackend.common.DeleteRequest;
 import org.example.yunpicturebackend.common.ResultUtils;
-import org.example.yunpicturebackend.model.dto.UserLoginRequest;
-import org.example.yunpicturebackend.model.dto.UserRegisterRequest;
+import org.example.yunpicturebackend.constant.UserConstant;
+import org.example.yunpicturebackend.exception.BusinessException;
+import org.example.yunpicturebackend.model.dto.user.*;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
 import org.example.yunpicturebackend.model.entity.User;
 import org.example.yunpicturebackend.model.vo.LoginUserVO;
+import org.example.yunpicturebackend.model.vo.UserVO;
 import org.example.yunpicturebackend.service.UserService;
+import org.springframework.beans.BeanUtils;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.List;
 
 /**
  * 用户接口控制器 (表现层)
@@ -172,6 +179,147 @@ public class UserController {
         return ResultUtils.success(result);
     }
 
+
+    /*
+     * =======================================================================================
+     * 【架构设计说明】为什么以下基础 CRUD 接口没有将逻辑抽离到 Service 层自定义方法中？
+     *
+     * 在传统的经典三层架构中，通常要求 Controller 只负责接收请求，所有逻辑必须下沉到 Service 层。
+     * 但在现代敏捷开发（尤其是深度集成 MyBatis Plus 框架）的工程实践中，我们采用了更务实的策略（Pragmatic CRUD）：
+     *
+     * 1. 拒绝冗余的“套娃”代码：对于单表、单次的简单操作（如直接根据 ID 更新/删除），如果强行抽离到 Service 层，
+     * 往往只会产生毫无业务增量的透传代码（Controller 传给 Service，Service 直接调底层），徒增维护成本。
+     * 2. 充分利用 IService 通用能力：MyBatis Plus 的 IService 本身已经充当了通用业务层，提供了完善的
+     * save、removeById、updateById、page 等方法。对于简单操作，Controller 完成参数校验和转换后直接调用即可。
+     * 3. 严格的边界划分：只有面临“多表关联、强事务控制、复杂的业务规则编排”（例如：用户注册时的查重与密码加盐逻辑）时，
+     * 才会严格将其封装到 Service 层的自定义业务方法中。
+     * =======================================================================================
+     */
+
+    /**
+     * 创建用户（仅管理员）
+     * <p>
+     * 【业务场景】后台管理系统中，由管理员手动录入新用户。
+     *
+     * @param userAddRequest 用户创建请求参数（包含账号、角色等基本信息）
+     * @return 新建用户的 ID
+     */
+    @PostMapping("/add")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Long> addUser(@RequestBody UserAddRequest userAddRequest) {
+        // 1. 防御性拦截：确保请求体不为空
+        ThrowUtils.throwIf(userAddRequest == null, ErrorCode.PARAMS_ERROR);
+
+        // 2. 数据转换 (DTO -> Entity)：将前端传入的参数拷贝到数据库实体中
+        User user = new User();
+        BeanUtils.copyProperties(userAddRequest, user);
+
+        // 3. 业务规则处理：为后台手动创建的用户统一设置默认密码，并进行加密
+        final String DEFAULT_PASSWORD = "12345678";
+        String encryptPassword = userService.getEncryptPassword(DEFAULT_PASSWORD);
+        user.setUserPassword(encryptPassword);
+
+        // 4. 持久化：调用 MyBatis Plus 提供的通用 save 方法写入数据库
+        boolean result = userService.save(user);
+        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+
+        return ResultUtils.success(user.getId());
+    }
+
+    /**
+     * 根据 ID 获取用户完整信息（仅管理员）
+     * <p>
+     * 【注意】此接口返回的是 User 实体类，包含密码盐值等极度敏感信息，因此必须限制为管理员调用。
+     */
+    @GetMapping("/get")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<User> getUserById(long id) {
+        ThrowUtils.throwIf(id <= 0, ErrorCode.PARAMS_ERROR);
+        // 直接调用 MyBatis Plus 底层方法查询
+        User user = userService.getById(id);
+        ThrowUtils.throwIf(user == null, ErrorCode.NOT_FOUND_ERROR);
+        return ResultUtils.success(user);
+    }
+
+    /**
+     * 根据 ID 获取脱敏后的用户视图对象 (VO)
+     * <p>
+     * 【业务场景】通常用于前端展示某个用户的公开主页或基本信息。
+     */
+    @GetMapping("/get/vo")
+    public BaseResponse<UserVO> getUserVOById(long id) {
+        // 【⚠️ Spring AOP 陷阱预警】
+        // 此处直接调用了同类中的 getUserById(id) 方法。
+        // 由于是内部调用 (this.getUserById)，Spring AOP 代理会失效！
+        // 这意味着 getUserById 上的 @AuthCheck(mustRole = "admin") 注解在这里【不会生效】。
+        // 因此，普通用户也能通过这个接口拿到结果（这在此处刚好符合取 VO 脱敏数据的公开需求，但属于歪打正着，建议留意）。
+        BaseResponse<User> response = getUserById(id);
+        User user = response.getData();
+
+        // 返回前进行数据脱敏
+        return ResultUtils.success(userService.getUserVO(user));
+    }
+
+    /**
+     * 删除用户（仅管理员）
+     */
+    @PostMapping("/delete")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Boolean> deleteUser(@RequestBody DeleteRequest deleteRequest) {
+        if (deleteRequest == null || deleteRequest.getId() <= 0) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR);
+        }
+        // 调用 MyBatis Plus 逻辑删除 / 物理删除
+        boolean b = userService.removeById(deleteRequest.getId());
+        return ResultUtils.success(b);
+    }
+
+    /**
+     * 更新用户信息（仅管理员）
+     */
+    @PostMapping("/update")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Boolean> updateUser(@RequestBody UserUpdateRequest userUpdateRequest) {
+        if (userUpdateRequest == null || userUpdateRequest.getId() == null) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR);
+        }
+        User user = new User();
+        BeanUtils.copyProperties(userUpdateRequest, user);
+
+        // 调用 MyBatis Plus 提供的通用 updateById，它会动态判断：只有非空的字段才会更新
+        boolean result = userService.updateById(user);
+        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+
+        return ResultUtils.success(true);
+    }
+
+    /**
+     * 分页获取用户脱敏列表（仅管理员）
+     */
+    @PostMapping("/list/page/vo")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Page<UserVO>> listUserVOByPage(@RequestBody UserQueryRequest userQueryRequest) {
+        ThrowUtils.throwIf(userQueryRequest == null, ErrorCode.PARAMS_ERROR);
+
+        long current = userQueryRequest.getCurrent();
+        long pageSize = userQueryRequest.getPageSize();
+
+        // 1. 查出数据库中的原始分页对象（包含完整的 User 实体）
+        Page<User> userPage = userService.page(
+                new Page<>(current, pageSize),
+                userService.getQueryWrapper(userQueryRequest)
+        );
+
+        // 2. 初始化目标 VO 分页对象，将分页元数据（当前页、页大小、总条数）拷贝过去
+        Page<UserVO> userVOPage = new Page<>(current, pageSize, userPage.getTotal());
+
+        // 3. 将分页对象中的 Records（实体列表）批量转换为 VO 列表
+        List<UserVO> userVOList = userService.getUserVoList(userPage.getRecords());
+
+        // 4. 将脱敏后的列表塞入新的分页对象中返回
+        userVOPage.setRecords(userVOList);
+        return ResultUtils.success(userVOPage);
+    }
 
 
 }
