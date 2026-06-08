@@ -8,6 +8,10 @@ server:
 spring:
   application:
     name: yun-picture-backend  # 应用名称
+  # 开放更大的文件上传体积
+  servlet:
+    multipart:
+      max-file-size: 10MB
 
   # 数据库配置
   datasource:
@@ -58,3 +62,11 @@ knife4j:
           # 指定具体的 Controller 包路径，该包下的所有接口都会被扫描并生成到 default 分组中
           - org.example.yunpicturebackend.controller
 
+## 对象存储配置（从腾讯云获取）
+#cos:
+#  client:
+#    host: xxx
+#    secretId: xxx
+#    secretKey: xxx
+#    region: xxx
+#    bucket: xxx
