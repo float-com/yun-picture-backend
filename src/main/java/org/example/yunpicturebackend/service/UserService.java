@@ -131,4 +131,16 @@ public interface UserService extends IService<User> {
      */
     QueryWrapper<User> getQueryWrapper(UserQueryRequest userQueryRequest);
 
+
+
+    /**
+     * 判断指定用户是否具备管理员权限
+     * <p>
+     * 业务规则：会安全校验传入的用户对象，若对象为空或角色不匹配，均视为非管理员。
+     *
+     * @param user 需要校验权限的用户对象（允许传入 null）
+     * @return boolean 若用户为管理员返回 true；否则（含 user 为 null 的情况）返回 false
+     */
+    boolean isAdmin(User user);
+
 }

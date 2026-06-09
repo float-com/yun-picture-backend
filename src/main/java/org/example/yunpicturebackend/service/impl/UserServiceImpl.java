@@ -434,6 +434,14 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User>
         return queryWrapper;
     }
 
+
+    @Override
+    public boolean isAdmin(User user) {
+        // 判空保护，并校验用户的角色属性是否与系统预设的管理员枚举值一致
+        return user != null && UserRoleEnum.ADMIN.getValue().equals(user.getUserRole());
+    }
+
+
 }
 
 

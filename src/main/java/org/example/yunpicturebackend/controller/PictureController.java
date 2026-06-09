@@ -1,20 +1,35 @@
 package org.example.yunpicturebackend.controller;
 
+import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.extern.slf4j.Slf4j;
 import org.example.yunpicturebackend.annotation.AuthCheck;
 import org.example.yunpicturebackend.common.BaseResponse;
+import org.example.yunpicturebackend.common.DeleteRequest;
 import org.example.yunpicturebackend.common.ResultUtils;
 import org.example.yunpicturebackend.constant.UserConstant;
+import org.example.yunpicturebackend.exception.BusinessException;
+import org.example.yunpicturebackend.exception.ErrorCode;
+import org.example.yunpicturebackend.exception.ThrowUtils;
+import org.example.yunpicturebackend.model.dto.picture.PictureEditRequest;
+import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
+import org.example.yunpicturebackend.model.dto.picture.PictureUpdateRequest;
 import org.example.yunpicturebackend.model.dto.picture.PictureUploadRequest;
+import org.example.yunpicturebackend.model.entity.Picture;
 import org.example.yunpicturebackend.model.entity.User;
+import org.example.yunpicturebackend.model.vo.PictureTagCategory;
 import org.example.yunpicturebackend.model.vo.PictureVO;
 import org.example.yunpicturebackend.service.PictureService;
 import org.example.yunpicturebackend.service.UserService;
+import org.springframework.beans.BeanUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
 
 
 /**
@@ -69,5 +84,211 @@ public class PictureController {
         // 3. 将最终生成的脱敏视图对象包装为全局统一的标准 JSON 格式并返回
         return ResultUtils.success(pictureVO);
     }
+
+
+
+    /**
+     * 删除图片接口
+     *
+     * @PostMapping: RESTful 风格的路由注解。
+     * 架构考量：在绝对标准的 REST 规范中，删除应使用 @DeleteMapping。但在许多大厂实践中，
+     * 为了规避某些老旧网关/防火墙对 DELETE 请求的拦截，或者为了统一使用请求体 (Body) 传递扩展参数，往往统一妥协使用 @PostMapping。
+     *
+     * @param deleteRequest 包含待删除图片 ID 的请求体，封装为 DTO 以便后续无缝增加其他参数
+     * @param request       Tomcat 注入的原生 HTTP 请求对象，核心作用是用来校验当前的登录态
+     * @return 包装在统一响应体 BaseResponse 中的布尔值，标识是否删除成功
+     */
+    @PostMapping("/delete")
+    public BaseResponse<Boolean> deletePicture(
+            /*
+             * @RequestBody: 核心反序列化注解。
+             * 拦截前端发来的 JSON 格式请求体，自动将其装配为底层的 DeleteRequest 数据传输对象。
+             */
+            @RequestBody DeleteRequest deleteRequest,
+            HttpServletRequest request) {
+
+        // 1. 防御性拦截：确保请求载荷合法
+        // 任何依赖 ID 的操作，第一步永远是防空和防非负数。如果这里不拦截，查库时可能会引发全表扫描或底层报错。
+        if (deleteRequest == null || deleteRequest.getId() <= 0) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR);
+        }
+
+        // 2. 提取当前上下文的登录用户
+        // 核心安全准则：永远不要相信前端传来的 userId，一定要从后端的 Session/Token 中去取，防止水平越权。
+        User loginUser = userService.getLoginUser(request);
+        long id = deleteRequest.getId();
+
+        // 3. 校验目标资源是否存在
+        // 经典的“查后删”逻辑：先确认数据库里确实有这条记录，才能进行后续的权限校验。
+        Picture oldPicture = pictureService.getById(id);
+        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR);
+
+        // 4. 越权防御（核心安全机制）
+        // 业务规则：这条图片到底谁能删？只有“图片的创建者”或者“全站管理员”可以。
+        // 如果两者都不是，直接抛出无权限异常，阻断恶意用户的越权删除尝试。
+        if (!oldPicture.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR);
+        }
+
+        // 5. 执行物理/逻辑删除
+        // 委托给 MyBatis-Plus 的 IService 执行删除，并严格校验底层受影响的行数。
+        boolean result = pictureService.removeById(id);
+        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+
+        // 6. 统一格式返回
+        return ResultUtils.success(true);
+    }
+
+    /**
+     * 更新图片接口（仅管理员可用）
+     *
+     * @AuthCheck: 自定义权限拦截注解。
+     * 架构考量：利用 AOP (面向切面编程) 将权限校验逻辑与业务逻辑剥离。
+     * 方法一旦被打上该注解，在进入 Controller 逻辑前就会被切面拦截，如果当前登录用户没有 ADMIN_ROLE 角色，会直接抛出异常，无需在业务代码中反复手写 if(isAdmin) 判断。
+     *
+     * @param pictureUpdateRequest 包含前端传入的最新图片属性的请求对象 (DTO)
+     * @return 统一响应体，更新成功返回 true
+     */
+    @PostMapping("/update")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Boolean> updatePicture(@RequestBody PictureUpdateRequest pictureUpdateRequest) {
+
+        // 1. 基础参数防御
+        if (pictureUpdateRequest == null || pictureUpdateRequest.getId() <= 0) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR);
+        }
+
+        // 2. DTO 转 Entity (核心隔离设计)
+        // Controller 层的职责之一就是“数据转换”。前端传来的 DTO 和数据库对应的 Entity 必须隔离，
+        // 我们通过 BeanUtils 将 DTO 中的属性浅拷贝到 Entity 中准备入库。
+        Picture picture = new Picture();
+        BeanUtils.copyProperties(pictureUpdateRequest, picture);
+
+        // 3. 特殊字段处理 (JSON 序列化)
+        // 数据库通常没有直接的 List 字段，需要将其序列化为 JSON 字符串存储。
+        picture.setTags(JSONUtil.toJsonStr(pictureUpdateRequest.getTags()));
+
+        // 4. 数据业务校验
+        // 委托给 Service 层进行核心字段的非空、长度等严格校验。
+        pictureService.validPicture(picture);
+
+        // 5. 校验目标记录存在性
+        long id = pictureUpdateRequest.getId();
+        Picture oldPicture = pictureService.getById(id);
+        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR);
+
+        // 6. 覆盖更新并响应
+        boolean result = pictureService.updateById(picture);
+        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        return ResultUtils.success(true);
+    }
+
+    /**
+     * 分页获取图片视图列表接口（供 C 端普通用户使用）
+     *
+     * 为什么分出 /page 和 /page/vo 两个接口？
+     * 架构考量：读写分离原则。后台管理员需要看底层全量字段（如物理文件路径、逻辑删除标识等），调 /page；
+     * C 端用户只需要看展示信息，调 /page/vo，后者会在 Service 层经过严格的脱敏和关联用户信息处理，防止数据泄露。
+     *
+     * @param pictureQueryRequest 包含分页参数和复杂检索条件的 DTO
+     * @param request             用于提取当前登录态
+     * @return 包含脱敏数据分页对象 (Page<PictureVO>) 的统一响应体
+     */
+    @PostMapping("/list/page/vo")
+    public BaseResponse<Page<PictureVO>> listPictureVOByPage(
+            @RequestBody PictureQueryRequest pictureQueryRequest,
+            HttpServletRequest request) {
+
+        long current = pictureQueryRequest.getCurrent();
+        long size = pictureQueryRequest.getPageSize();
+
+        // 1. 安全防御：防止恶意爬虫
+        // 如果不限制 size，黑客可能发送 size=100000 的请求，一次性拉取全库数据，导致服务器 OOM (内存溢出) 或数据库崩溃。
+        ThrowUtils.throwIf(size > 20, ErrorCode.PARAMS_ERROR);
+
+        // 2. 底层数据检索
+        // 委托给 Service 层，将 DTO 解析为 MyBatis-Plus 的 QueryWrapper 动态 SQL 语句，并在数据库中执行分页。
+        Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
+                pictureService.getQueryWrapper(pictureQueryRequest));
+
+        // 3. 视图模型装配 (解决 N+1 问题)
+        // 在 getPictureVOPage 方法内部，不仅会将 Picture 转换为 PictureVO，
+        // 还会采用批量查询的方式查出所有作者信息并组装，保证高性能的视图渲染。
+        return ResultUtils.success(pictureService.getPictureVOPage(picturePage, request));
+    }
+
+    /**
+     * 编辑图片接口（供普通用户使用）
+     *
+     * Edit (编辑) 和 Update (更新) 的核心区别是什么？
+     * 1. 业务对象不同：Update 面向管理员，允许全量覆盖；Edit 面向普通用户，通常只允许修改系统开放的部分字段（如名字、标签）。
+     * 2. 权限维度不同：Update 靠 @AuthCheck 一刀切拦截；Edit 必须在代码深处校验“你是不是这张图片的主人”。
+     *
+     * @param pictureEditRequest  包含修改字段的请求 DTO
+     * @param request             HTTP 原生请求对象，用于鉴权
+     * @return 统一响应体，编辑成功返回 true
+     */
+    @PostMapping("/edit")
+    public BaseResponse<Boolean> editPicture(@RequestBody PictureEditRequest pictureEditRequest, HttpServletRequest request) {
+
+        // 1. 基础防空
+        if (pictureEditRequest == null || pictureEditRequest.getId() <= 0) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR);
+        }
+
+        // 2. DTO 映射及特殊字段处理
+        Picture picture = new Picture();
+        BeanUtils.copyProperties(pictureEditRequest, picture);
+        picture.setTags(JSONUtil.toJsonStr(pictureEditRequest.getTags()));
+
+        // 业务补充：只要发生编辑，就刷新最后编辑时间，方便后续做“近期修改”排序或缓存失效策略
+        picture.setEditTime(new Date());
+
+        // 3. 合法性检查
+        pictureService.validPicture(picture);
+
+        User loginUser = userService.getLoginUser(request);
+        long id = pictureEditRequest.getId();
+
+        // 4. 提取原数据准备越权校验
+        Picture oldPicture = pictureService.getById(id);
+        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR);
+
+        // 5. 核心越权防御
+        // 逻辑：如果“原图片的归属者”不是“当前登录用户”，并且“当前登录用户”也不是“管理员”，则拒绝访问。
+        if (!oldPicture.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR);
+        }
+
+        // 6. 落库保存
+        boolean result = pictureService.updateById(picture);
+        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        return ResultUtils.success(true);
+    }
+
+    /**
+     * 获取预设的图片标签与分类选项列表（业务初期可以先这样写）
+     * <p>
+     * 【接口描述】供前端在“上传图片”或“图片大盘筛选”表单中，渲染下拉菜单或标签选择器时使用。
+     * 【架构考量】
+     * 1. 网络层优化：将“标签”和“分类”这两个独立的字典数据合并在同一个接口中下发，有效减少了前端的 HTTP 请求次数（从 2 次降为 1 次），提升了页面首屏渲染性能。
+     * 2. 演进说明：当前系统处于初创阶段，采用硬编码 (Hardcode) 的形式快速提供基础枚举数据。在后续迭代中，这部分数据通常会迁移到数据库的“数据字典表”中动态维护，并结合 Redis 缓存以保障高并发读取。
+     * 【权限控制】基础公共接口，所有用户（含未登录的访客）均可访问。
+     *
+     * @return BaseResponse<PictureTagCategory> 包含预设标签列表和分类列表的聚合响应体
+     */
+    @GetMapping("/tag_category")
+    public BaseResponse<PictureTagCategory> listPictureTagCategory() {
+        PictureTagCategory pictureTagCategory = new PictureTagCategory();
+        // 硬编码预设标签
+        List<String> tagList = Arrays.asList("热门", "搞笑", "生活", "高清", "艺术", "校园", "背景", "简历", "创意");
+        // 硬编码预设分类
+        List<String> categoryList = Arrays.asList("模板", "电商", "表情包", "素材", "海报");
+        pictureTagCategory.setTagList(tagList);
+        pictureTagCategory.setCategoryList(categoryList);
+        return ResultUtils.success(pictureTagCategory);
+    }
+
+
 
 }
