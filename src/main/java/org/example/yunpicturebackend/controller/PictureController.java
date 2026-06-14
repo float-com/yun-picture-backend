@@ -11,12 +11,10 @@ import org.example.yunpicturebackend.constant.UserConstant;
 import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
-import org.example.yunpicturebackend.model.dto.picture.PictureEditRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureUpdateRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureUploadRequest;
+import org.example.yunpicturebackend.model.dto.picture.*;
 import org.example.yunpicturebackend.model.entity.Picture;
 import org.example.yunpicturebackend.model.entity.User;
+import org.example.yunpicturebackend.model.enums.PictureReviewStatusEnum;
 import org.example.yunpicturebackend.model.vo.PictureTagCategory;
 import org.example.yunpicturebackend.model.vo.PictureVO;
 import org.example.yunpicturebackend.service.PictureService;
@@ -67,7 +65,7 @@ public class PictureController {
      * @return 统一返回体包装的 PictureVO 视图对象，包含图片的公网访问 URL 和各项解析出来的元数据。
      */
     @PostMapping("/upload")
-    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE) // 权限拦截：仅允许具有管理员角色的用户访问此接口，防止普通用户恶意调用上传耗费云存储
+    //@AuthCheck(mustRole = UserConstant.ADMIN_ROLE) // 权限拦截：仅允许具有管理员角色的用户访问此接口，防止普通用户恶意调用上传耗费云存储
     public BaseResponse<PictureVO> uploadPicture(
             @RequestPart("file") MultipartFile multipartFile,
             PictureUploadRequest pictureUploadRequest,
@@ -151,7 +149,8 @@ public class PictureController {
      */
     @PostMapping("/update")
     @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
-    public BaseResponse<Boolean> updatePicture(@RequestBody PictureUpdateRequest pictureUpdateRequest) {
+    public BaseResponse<Boolean> updatePicture(@RequestBody PictureUpdateRequest pictureUpdateRequest,
+                                               HttpServletRequest request) {
 
         // 1. 基础参数防御
         if (pictureUpdateRequest == null || pictureUpdateRequest.getId() <= 0) {
@@ -177,11 +176,73 @@ public class PictureController {
         Picture oldPicture = pictureService.getById(id);
         ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR);
 
+        //补充审核参数【非常重要】
+        User loginUser = userService.getLoginUser(request);
+        pictureService.fillReviewParams(picture,loginUser);
+
+
         // 6. 覆盖更新并响应
         boolean result = pictureService.updateById(picture);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
         return ResultUtils.success(true);
     }
+
+
+    /**
+     * 根据 id 获取图片原始信息（仅管理员可用）
+     * <p>返回底层全量字段（包含物理文件路径等敏感信息），不作脱敏处理。</p>
+     *
+     * @param id      图片 ID
+     * @param request HTTP 请求对象
+     * @return 包含图片原始实体信息的统一响应体
+     */
+    @GetMapping("/get")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Picture> getPictureById(long id, HttpServletRequest request) {
+        ThrowUtils.throwIf(id <= 0, ErrorCode.PARAMS_ERROR);
+        // 1. 查询数据库获取底层实体
+        Picture picture = pictureService.getById(id);
+        ThrowUtils.throwIf(picture == null, ErrorCode.NOT_FOUND_ERROR);
+        // 2. 封装并返回原始数据
+        return ResultUtils.success(picture);
+    }
+
+    /**
+     * 根据 id 获取图片视图对象（供 C 端普通用户使用）
+     * <p>对底层实体进行脱敏及关联信息组装，适用于前端详情展示。</p>
+     *
+     * @param id      图片 ID
+     * @param request HTTP 请求对象
+     * @return 包含图片脱敏视图对象 (PictureVO) 的统一响应体
+     */
+    @GetMapping("/get/vo")
+    public BaseResponse<PictureVO> getPictureVOById(long id, HttpServletRequest request) {
+        ThrowUtils.throwIf(id <= 0, ErrorCode.PARAMS_ERROR);
+        // 1. 查询数据库获取底层实体
+        Picture picture = pictureService.getById(id);
+        ThrowUtils.throwIf(picture == null, ErrorCode.NOT_FOUND_ERROR);
+        // 2. 转换为视图对象并返回
+        return ResultUtils.success(pictureService.getPictureVO(picture, request));
+    }
+
+    /**
+     * 分页获取图片原始列表（仅管理员可用）
+     * <p>支持复杂条件检索，返回未脱敏的全量字段，用于后台管理系统。</p>
+     *
+     * @param pictureQueryRequest 包含分页参数和检索条件的请求体
+     * @return 包含图片原始数据分页对象的统一响应体
+     */
+    @PostMapping("/list/page")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Page<Picture>> listPictureByPage(@RequestBody PictureQueryRequest pictureQueryRequest) {
+        long current = pictureQueryRequest.getCurrent();
+        long size = pictureQueryRequest.getPageSize();
+        // 构建动态查询条件并执行分页查询
+        Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
+                pictureService.getQueryWrapper(pictureQueryRequest));
+        return ResultUtils.success(picturePage);
+    }
+
 
     /**
      * 分页获取图片视图列表接口（供 C 端普通用户使用）
@@ -205,6 +266,9 @@ public class PictureController {
         // 1. 安全防御：防止恶意爬虫
         // 如果不限制 size，黑客可能发送 size=100000 的请求，一次性拉取全库数据，导致服务器 OOM (内存溢出) 或数据库崩溃。
         ThrowUtils.throwIf(size > 20, ErrorCode.PARAMS_ERROR);
+
+        // 新增：普通用户默认只能查看已过审的数据【非常重要的权限隔离】
+        pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
 
         // 2. 底层数据检索
         // 委托给 Service 层，将 DTO 解析为 MyBatis-Plus 的 QueryWrapper 动态 SQL 语句，并在数据库中执行分页。
@@ -239,6 +303,7 @@ public class PictureController {
         // 2. DTO 映射及特殊字段处理
         Picture picture = new Picture();
         BeanUtils.copyProperties(pictureEditRequest, picture);
+        //注意将List 转为 String
         picture.setTags(JSONUtil.toJsonStr(pictureEditRequest.getTags()));
 
         // 业务补充：只要发生编辑，就刷新最后编辑时间，方便后续做“近期修改”排序或缓存失效策略
@@ -248,6 +313,9 @@ public class PictureController {
         pictureService.validPicture(picture);
 
         User loginUser = userService.getLoginUser(request);
+
+        //补充审核参数【非常重要】
+        pictureService.fillReviewParams(picture,loginUser);
         long id = pictureEditRequest.getId();
 
         // 4. 提取原数据准备越权校验
@@ -288,6 +356,41 @@ public class PictureController {
         pictureTagCategory.setCategoryList(categoryList);
         return ResultUtils.success(pictureTagCategory);
     }
+
+
+
+    /**
+     * 图片审核接口（仅供后台管理员使用）
+     * <p>
+     * 【业务场景】系统内容安全的最后一道防线。决定用户上传的图片是否能够流入公共图库进行公开展示。
+     * 【权限控制】严格受限接口。通过 @AuthCheck(mustRole = ADMIN_ROLE) 注解进行 AOP 级别的“一刀切”拦截，强制要求调用方必须具备管理员角色。
+     * 【架构考量】
+     * 为什么不在 Controller 层做具体的枚举比对和数据库校验？
+     * MVC 架构中 Controller 应当保持“薄”的特性，主要负责路由和基础网关工作。
+     * 此处仅做最基础的 HTTP 防空，并提取可信的登录态上下文（loginUser）。
+     * 至于“防重复审核（幂等性）”、“枚举值合法性”、“数据的按需更新”等纯业务逻辑，统一下沉至 Service 层的方法内聚处理。
+     *
+     * @param pictureReviewRequest 包含目标审核状态、驳回原因等核心参数的请求 DTO
+     * @param request              HTTP 原生请求对象，用于提取当前操作的管理员凭证（Session/Token）
+     * @return BaseResponse<Boolean> 统一响应体，审核操作执行成功则返回 true
+     */
+    @PostMapping("/review")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Boolean> doPictureReview(@RequestBody PictureReviewRequest pictureReviewRequest,
+                                                 HttpServletRequest request) {
+        // 1. 基础防空拦截：将连请求体都没传的非法请求直接拒之门外
+        ThrowUtils.throwIf(pictureReviewRequest == null, ErrorCode.PARAMS_ERROR);
+
+        // 2. 提取上下文：从可信的后端环境中安全获取当前登录的管理员信息，为后续记录“审核人(reviewerId)”提供防篡改的数据源
+        User loginUser = userService.getLoginUser(request);
+
+        // 3. 委派执行：将核心的审核逻辑（查库、校验、幂等防重、修改落库）交由 Service 层处理
+        pictureService.doPictureReview(pictureReviewRequest, loginUser);
+
+        // 4. 封装并返回标准响应体
+        return ResultUtils.success(true);
+    }
+
 
 
 

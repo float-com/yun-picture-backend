@@ -76,3 +76,21 @@ CREATE TABLE IF NOT EXISTS picture
     INDEX idx_tags (tags)                               COMMENT '普通索引：用于标签精确匹配查询（注：若需对 JSON 数组内的元素进行复杂检索，推荐使用 MySQL 5.7+ 虚拟列索引或 ES）',
     INDEX idx_userId (userId)                           COMMENT '普通索引：加速查询某位用户上传的所有图片（个人图库或我的上传功能的核心索引）'
 ) COMMENT '图片信息表' COLLATE = utf8mb4_unicode_ci;
+
+
+
+
+-- ==========================================
+-- 新增字段：图片审核与内容安全管控机制
+-- ==========================================
+ALTER TABLE picture
+    -- 添加新列
+    ADD COLUMN reviewStatus  INT          DEFAULT 0 NOT NULL COMMENT '审核状态（枚举值：0-待审核; 1-通过; 2-拒绝。用于内容安全管控，决定图片是否允许在公共图库公开展示，默认上传进入待审核池）',
+    ADD COLUMN reviewMessage VARCHAR(512)           NULL     COMMENT '审核反馈信息（当审核状态为拒绝时，记录具体的违规原因或整改建议，便于前端向上传者展示驳回理由）',
+    ADD COLUMN reviewerId    BIGINT                 NULL     COMMENT '审核操作人 ID（关联后台管理员/审核人员的主键，用于追溯审核责任人及统计个人的审核工作量）',
+    ADD COLUMN reviewTime    DATETIME               NULL     COMMENT '审核操作时间（记录管理员具体执行审核通过或拒绝动作的时间点，用于审核时效性分析）';
+
+-- ==========================================
+-- 补充索引：加速审核业务查询
+-- ==========================================
+CREATE INDEX idx_reviewStatus ON picture (reviewStatus) COMMENT '普通索引：加速后台管理系统筛选待审核或特定状态的图片列表，大幅提升审核工作台的加载性能';

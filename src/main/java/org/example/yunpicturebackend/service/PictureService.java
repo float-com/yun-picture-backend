@@ -3,6 +3,7 @@ package org.example.yunpicturebackend.service;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
+import org.example.yunpicturebackend.model.dto.picture.PictureReviewRequest;
 import org.example.yunpicturebackend.model.dto.picture.PictureUploadRequest;
 import org.example.yunpicturebackend.model.entity.Picture;
 import com.baomidou.mybatisplus.extension.service.IService;
@@ -89,4 +90,27 @@ public interface PictureService extends IService<Picture> {
      * @param picture 待校验的图片实体对象（若传入 null 方法内部亦会抛出异常）
      */
     void validPicture(Picture picture);
+
+
+    /**
+     * 核心业务：图片审核
+     * <p>
+     * 由后台管理员执行，对上传的图片进行内容安全审核（通过/拒绝）。
+     * </p>
+     *
+     * @param pictureReviewRequest 审核请求参数（包含被审核图片 ID、目标审核状态、审核驳回信息）
+     * @param loginUser            当前登录的用户上下文（即执行审核操作的管理员，用于安全提取 reviewerId）
+     */
+    void doPictureReview(PictureReviewRequest pictureReviewRequest, User loginUser);
+
+    /**
+     * 自动填充图片审核相关参数
+     * <p>
+     * 根据当前操作用户的角色（管理员/普通用户），自动为图片实体装配对应的审核状态及附加审计信息。
+     * </p>
+     *
+     * @param picture   需要填充审核参数的图片实体对象
+     * @param loginUser 当前执行操作的登录用户
+     */
+    void fillReviewParams(Picture picture, User loginUser);
 }

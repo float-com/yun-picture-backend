@@ -102,4 +102,24 @@ public class Picture {
      */
     @TableLogic
     private Integer isDelete;
+
+    /**
+     * 审核状态（枚举值：0-待审核; 1-通过; 2-拒绝。用于内容安全管控，决定图片是否允许在公共图库公开展示，默认上传进入待审核池）
+     */
+    private Integer reviewStatus;
+
+    /**
+     * 审核反馈信息（当审核状态为拒绝时，记录具体的违规原因或整改建议，便于前端向上传者展示驳回理由）
+     */
+    private String reviewMessage;
+
+    /**
+     * 审核操作人 ID（关联后台管理员/审核人员的主键，用于追溯审核责任人及统计个人的审核工作量）
+     */
+    private Long reviewerId;
+
+    /**
+     * 审核操作时间（记录管理员具体执行审核通过或拒绝动作的时间点，用于审核时效性分析）
+     */
+    private Date reviewTime;
 }

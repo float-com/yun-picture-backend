@@ -6,19 +6,23 @@ import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
 import org.example.yunpicturebackend.manager.FileManager;
 import org.example.yunpicturebackend.model.dto.file.UploadPictureResult;
 import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
+import org.example.yunpicturebackend.model.dto.picture.PictureReviewRequest;
 import org.example.yunpicturebackend.model.dto.picture.PictureUploadRequest;
 import org.example.yunpicturebackend.model.entity.Picture;
 import org.example.yunpicturebackend.model.entity.User;
+import org.example.yunpicturebackend.model.enums.PictureReviewStatusEnum;
 import org.example.yunpicturebackend.model.vo.PictureVO;
 import org.example.yunpicturebackend.model.vo.UserVO;
 import org.example.yunpicturebackend.service.PictureService;
 import org.example.yunpicturebackend.mapper.PictureMapper;
 import org.example.yunpicturebackend.service.UserService;
+import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -76,13 +80,32 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
         // 3. 更新操作的防御性编程
         if (pictureId != null) {
-            // 如果是更新动作，必须查库校验待更新的图片记录是否真实存在。
-            // 避免前端传递虚假 ID 导致后续业务出现脏数据或空指针异常。
-            boolean exists = this.lambdaQuery()
-                    .eq(Picture::getId, pictureId)
-                    .exists();
-            ThrowUtils.throwIf(!exists, ErrorCode.NOT_FOUND_ERROR, "图片不存在");
-            // 注意：严格的生产环境中，这里可能还需要进一步校验该 pictureId 是否归属于当前 loginUser.getId()，防止水平越权（修改别人的图片）
+            // 3.1 查库获取历史记录
+            // 【架构演进说明】这里舍弃了之前通过 lambdaQuery().exists() 仅判断数据是否存在的轻量级做法。
+            // 原因：Controller 层取消了管理员权限的一刀切拦截后，我们必须获取到该记录的真实拥有者（userId），以便进行后续的越权校验。
+            Picture oldPicture = this.getById(pictureId);
+            ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR, "图片不存在或已被删除");
+
+            // 3.3 审核状态重置 (可选业务逻辑，视具体需求而定)
+            // 注意：如果用户修改了图片实体文件，通常意味着图片内容发生了变化，此时应当将图片的审核状态打回“待审核”。
+
+//      ///////////////////////////已弃用的代码//////////////////////////////////////
+//            // 如果是更新动作，必须查库校验待更新的图片记录是否真实存在。
+//            // 避免前端传递虚假 ID 导致后续业务出现脏数据或空指针异常。
+//            boolean exists = this.lambdaQuery()
+//                    .eq(Picture::getId, pictureId)
+//                    .exists();
+//            ThrowUtils.throwIf(!exists, ErrorCode.NOT_FOUND_ERROR, "图片不存在");
+//            // 注意：严格的生产环境中，这里可能还需要进一步校验该 pictureId 是否归属于当前 loginUser.getId()，防止水平越权（修改别人的图片）
+//      //////////////////////////////////////////////////////////////////////////
+
+            // 3.2 水平越权与垂直越权校验
+            // 【业务场景】开放普通用户上传/编辑权限后，必须严防“张三通过抓包修改 pictureId 来覆盖李四的图片”这种高危漏洞。
+            // 【校验逻辑】如果“原图片的归属者”不是“当前登录用户”（防水平越权），
+            // 并且“当前登录用户”也不是“管理员”（保留管理员全局管理的特权），则果断拒绝访问。
+            if (!oldPicture.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
+                throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "无权编辑他人的图片");
+            }
         }
 
         // 4. 动态构造云端对象存储的目录前缀
@@ -104,6 +127,9 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         picture.setPicFormat(uploadPictureResult.getPicFormat());
         // 绑定图片归属权，记录数据拥有者
         picture.setUserId(loginUser.getId());
+
+        // 更新字段之前先补充审核参数【极其重要】
+        this.fillReviewParams(picture,loginUser);
 
         // 7. 处理“更新操作”的特有字段逻辑
         if (pictureId != null) {
@@ -156,6 +182,11 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         Long userId = pictureQueryRequest.getUserId();
         String sortField = pictureQueryRequest.getSortField();
         String sortOrder = pictureQueryRequest.getSortOrder();
+        // 审核与权限相关字段的动态查询构建
+        Integer reviewStatus = pictureQueryRequest.getReviewStatus();
+        String reviewMessage = pictureQueryRequest.getReviewMessage();
+        Long reviewerId = pictureQueryRequest.getReviewerId();
+
 
         // 3. 聚合搜索（多字段组合模糊查询）
         if (StrUtil.isNotBlank(searchText)) {
@@ -174,11 +205,23 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         queryWrapper.like(StrUtil.isNotBlank(name), "name", name);
         queryWrapper.like(StrUtil.isNotBlank(introduction), "introduction", introduction);
         queryWrapper.like(StrUtil.isNotBlank(picFormat), "picFormat", picFormat);
+        // 动态拼接模糊查询 (like)：当审核驳回信息有值且不为空白字符时生效，方便后台溯源
+        queryWrapper.like(StrUtil.isNotBlank(reviewMessage), "reviewMessage", reviewMessage);
         queryWrapper.eq(StrUtil.isNotBlank(category), "category", category);
         queryWrapper.eq(ObjUtil.isNotEmpty(picWidth), "picWidth", picWidth);
         queryWrapper.eq(ObjUtil.isNotEmpty(picHeight), "picHeight", picHeight);
         queryWrapper.eq(ObjUtil.isNotEmpty(picSize), "picSize", picSize);
         queryWrapper.eq(ObjUtil.isNotEmpty(picScale), "picScale", picScale);
+        // 动态拼接等值查询 (eq)：当 reviewStatus 不为空时生效
+        queryWrapper.eq(ObjUtil.isNotEmpty(reviewStatus), "reviewStatus", reviewStatus);
+        // 动态拼接等值查询 (eq)：当操作人 ID 不为空时生效，用于筛选特定审核员处理的图片
+        queryWrapper.eq(ObjUtil.isNotEmpty(reviewerId), "reviewerId", reviewerId);
+
+
+
+
+
+
 
         // 5. JSON 数组字段查询 (tags)
         if (CollUtil.isNotEmpty(tags)) {
@@ -311,6 +354,128 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         }
     }
 
+
+    /**
+     * 执行图片内容审核操作
+     * <p>
+     * 业务场景：通常应用于后台管理系统的工作台。管理员对用户上传的图片进行内容合规性检查（如涉黄、侵权判定），
+     * 从而决定该图片是否获准在前端公共图库或瀑布流中公开展示。
+     * </p>
+     * <p>
+     * 处理逻辑与核心规则：
+     * 1. 基础拦截 (防御性编程)：校验入参合法性。明确限制审核的目标状态只能是“通过(1)”或“拒绝(2)”，严禁前端将其反向重置为“待审核(0)”。
+     * 2. 数据一致性校验：确认被审核的图片在数据库中真实存在，拦截对已物理删除/逻辑删除数据的无效操作。
+     * 3. 幂等性校验 (防重复提交)：对比数据库中的当前状态与前端请求的目标状态。若两者一致，则直接抛出异常拦截，防止因网络抖动或前端重复点击造成的无效数据库写操作。
+     * 4. 安全赋值与按需更新 (高阶处理)：
+     * - 权限与审计安全：强制从后端的 loginUser 上下文提取操作人 ID，并由服务器生成当前绝对时间，彻底杜绝前端伪造审核记录的风险。
+     * - 性能优化策略：利用 new Picture() 构建空对象并按需 set 字段，触发 MyBatis-Plus 的“非空动态更新”机制，避免全量字段（包含长文本）被无意义地覆盖刷新。
+     * </p>
+     *
+     * @param pictureReviewRequest 图片审核请求参数 DTO（包含：待审核图片的 ID、目标审核状态、审核驳回信息等）
+     * @param loginUser            当前执行审核操作的登录用户上下文（通常需确保该用户已通过 AOP 或拦截器的管理员权限校验）
+     * @throws BusinessException   (由 ThrowUtils 抛出) 当匹配到参数非法、图片不存在、重复审核或数据库更新失败等异常情况时，中断流程并向前端抛出业务异常
+     */
+    @Override
+    public void doPictureReview(PictureReviewRequest pictureReviewRequest, User loginUser) {
+        // ==========================================
+        // 1. 校验参数 (防御性编程：将非法的请求拦截在最外层)
+        // ==========================================
+        ThrowUtils.throwIf(pictureReviewRequest == null, ErrorCode.PARAMS_ERROR);
+
+        Long id = pictureReviewRequest.getId();
+        Integer reviewStatus = pictureReviewRequest.getReviewStatus();
+        PictureReviewStatusEnum reviewStatusEnum = PictureReviewStatusEnum.getEnumByValue(reviewStatus);
+
+        // 核心拦截：
+        // a. ID不能为空
+        // b. 传入的状态值必须能在枚举中找到匹配项
+        // c. 目标状态绝对不能是“待审核(REVIEWING)”，审核操作只能是“通过”或“拒绝”
+        if (id == null || reviewStatusEnum == null || PictureReviewStatusEnum.REVIEWING.equals(reviewStatusEnum)) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "非法的审核状态");
+        }
+
+        // ==========================================
+        // 2. 判断图片是否存在 (数据一致性校验)
+        // ==========================================
+        Picture oldPicture = this.getById(id);
+        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR, "图片不存在或已被删除");
+
+        // ==========================================
+        // 3. 校验审核状态是否重复 (幂等性校验)
+        // ==========================================
+        // 如果数据库中的当前状态，已经等于前端要修改的目标状态，则直接拦截。
+        // 作用：防止前端重复点击或网络重发导致的不必要数据库写操作。
+        if (oldPicture.getReviewStatus().equals(reviewStatus)) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "请勿重复审核");
+        }
+
+        // ==========================================
+        // 4. 数据库操作 (高阶技巧：按需更新与审计字段安全注入)
+        // ==========================================
+        // 性能优化：为什么这里要 new Picture() 而不是直接 updateById(oldPicture)？
+        // 因为 oldPicture 包含了图片的所有字段（甚至长文本简介等）。
+        // new 一个空对象，利用 MyBatis-Plus 默认的“非空更新”策略，底层生成的 SQL 只会 UPDATE 我们显式 set 的这几个字段。
+        Picture updatePicture = new Picture();
+
+        // 将 DTO 中的基础参数（id, reviewStatus, reviewMessage）拷贝到实体类中
+        BeanUtils.copyProperties(pictureReviewRequest, updatePicture);
+
+        // 安全防范：在此处补全审核人与审核时间。
+        // 绝不信任前端传递的权限数据，而是从后端的 loginUser (Session/Token) 取出管理员 ID，
+        // 并由服务器统一生成当前绝对时间，保证审计链路的真实性。
+        updatePicture.setReviewerId(loginUser.getId());
+        updatePicture.setReviewTime(new Date());
+
+        // 执行更新并校验结果
+        boolean result = this.updateById(updatePicture);
+        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片审核状态更新失败，请重试");
+    }
+
+
+
+    /**
+     * 自动填充图片审核相关参数
+     * <p>
+     * 【业务场景】
+     * 无论图片是首次上传（新增），还是后续被修改了元数据或物理文件（编辑），都需要重新判定其内容安全状态。
+     * 本方法根据操作人的身份执行差异化逻辑：
+     * 1. 管理员操作：享有“信任特权”，其上传或修改的图片默认直接过审（PASS），并自动留下审计痕迹。
+     * 2. 普通用户操作：触发“逢变必审”机制，状态强制重置或初始化为“待审核（REVIEWING）”，等待后台人工或机器介入。
+     * </p>
+     * <p>
+     * 【架构考量与抽取原因】
+     * 1. 遵循 DRY (Don't Repeat Yourself) 原则：新增图片、修改图片、甚至是未来的批量导入图片等多个核心业务流，
+     * 都需要执行这套“审核状态装配”逻辑。将其抽离为独立方法，极大降低了代码的冗余度。
+     * 2. 职责单一原则 (SRP)：让 uploadPicture 和 editPicture 等方法专注于“文件解析、参数校验与基础落库”，
+     * 将“内容安全与审核状态流转”的核心业务规则内聚于此。未来若需扩展逻辑（如：引入白名单用户免审、接入第三方机审 API），只需在此一处改动即可，系统扩展性极强。
+     * 3. 提升安全性与一致性：统一收口审核状态的赋值逻辑，有效避免团队协作时在不同接口中漏写、错写状态重置代码，
+     * 从而彻底杜绝“普通用户修改旧图片绕过审核”的安全漏洞。
+     * </p>
+     *
+     * @param picture   待装配审核参数的图片实体（通常是在实体基础属性组装完毕后、准备执行 saveOrUpdate 落库前调用）
+     * @param loginUser 当前执行操作的登录上下文（用于判断是否具备管理员特权）
+     */
+    @Override
+    public void fillReviewParams(Picture picture, User loginUser) {
+        if (userService.isAdmin(loginUser)) {
+            // ==========================================
+            // 管理员特权通道：自动赋予“通过”状态，并完善审计追踪字段
+            // ==========================================
+            picture.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
+            picture.setReviewerId(loginUser.getId());
+            picture.setReviewMessage("管理员自动过审");
+            picture.setReviewTime(new Date());
+        } else {
+            // ==========================================
+            // 普通用户通道：强制进入/重置为“待审核”池
+            // ==========================================
+            picture.setReviewStatus(PictureReviewStatusEnum.REVIEWING.getValue());
+
+            // 架构提示：针对“编辑旧图片”的场景，一旦状态被打回 REVIEWING，
+            // 实际上原有的 reviewerId 和 reviewMessage 应该视业务需求考虑是否被置空（设为 null），
+            // 避免前端在待审核状态下依然展示出上一次的历史审核驳回信息。当前系统若无此苛刻要求，仅重置状态即可拦截公开展示。
+        }
+    }
 
 
 
