@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
 import org.example.yunpicturebackend.model.dto.picture.PictureReviewRequest;
+import org.example.yunpicturebackend.model.dto.picture.PictureUploadByBatchRequest;
 import org.example.yunpicturebackend.model.dto.picture.PictureUploadRequest;
 import org.example.yunpicturebackend.model.entity.Picture;
 import com.baomidou.mybatisplus.extension.service.IService;
@@ -113,4 +114,17 @@ public interface PictureService extends IService<Picture> {
      * @param loginUser 当前执行操作的登录用户
      */
     void fillReviewParams(Picture picture, User loginUser);
+
+    /**
+     * 批量抓取和创建图片
+     *
+     * @param pictureUploadByBatchRequest 批量抓取图片的请求参数（包含搜索词和抓取数量）
+     * @param loginUser                   当前登录用户信息
+     * @return 成功抓取并创建的图片总数
+     */
+    Integer uploadPictureByBatch(
+            PictureUploadByBatchRequest pictureUploadByBatchRequest,
+            User loginUser
+    );
+
 }

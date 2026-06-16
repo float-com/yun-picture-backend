@@ -426,6 +426,32 @@ public class PictureController {
         return ResultUtils.success(true);
     }
 
+    /**
+     * 批量抓取并创建图片
+     * <p>仅限具有管理员权限的用户调用</p>
+     *
+     * @param pictureUploadByBatchRequest 包含搜索词和数量的请求体
+     * @param request                     HttpServletRequest，用于获取当前登录用户态
+     * @return 成功抓取和上传的图片数量
+     */
+    @PostMapping("/upload/batch")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE) // 权限校验：必须是管理员角色
+    public BaseResponse<Integer> uploadPictureByBatch(
+            @RequestBody PictureUploadByBatchRequest pictureUploadByBatchRequest,
+            HttpServletRequest request
+    ) {
+        // 1. 校验请求参数是否为空
+        ThrowUtils.throwIf(pictureUploadByBatchRequest == null, ErrorCode.PARAMS_ERROR);
+
+        // 2. 从 request 中获取当前登录的用户信息
+        User loginUser = userService.getLoginUser(request);
+
+        // 3. 调用 Service 层执行批量抓取并获取成功条数
+        int uploadCount = pictureService.uploadPictureByBatch(pictureUploadByBatchRequest, loginUser);
+
+        // 4. 返回统一包装的成功响应结果
+        return ResultUtils.success(uploadCount);
+    }
 
 
 

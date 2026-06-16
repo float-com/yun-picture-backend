@@ -33,7 +33,16 @@ public class PictureUploadRequest implements Serializable {
     private String fileUrl;
 
     /**
-     * 序列化版本号（用于保证反序列化时的兼容性）
+     * 图片名称
+     * <p>
+     * 业务场景：支持用户在上传单张图片或抓取单张网络图片时，主动为其指定一个有意义的名称。
+     * 联动逻辑：若前端传递了此值，后端的 uploadPicture 方法将优先采用该名称覆盖从物理文件或云端元数据中解析出的默认缺省名。
+     * </p>
+     */
+    private String picName;
+
+    /**
+     * 序列化版本号（用于保证跨服务或 Redis 缓存反序列化时的对象结构兼容性）
      */
     private static final long serialVersionUID = 1L;
 }

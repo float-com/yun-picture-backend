@@ -6,6 +6,7 @@ import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import lombok.extern.slf4j.Slf4j;
 import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
@@ -16,6 +17,7 @@ import org.example.yunpicturebackend.manager.upload.UrlPictureUpload;
 import org.example.yunpicturebackend.model.dto.file.UploadPictureResult;
 import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
 import org.example.yunpicturebackend.model.dto.picture.PictureReviewRequest;
+import org.example.yunpicturebackend.model.dto.picture.PictureUploadByBatchRequest;
 import org.example.yunpicturebackend.model.dto.picture.PictureUploadRequest;
 import org.example.yunpicturebackend.model.entity.Picture;
 import org.example.yunpicturebackend.model.entity.User;
@@ -25,12 +27,17 @@ import org.example.yunpicturebackend.model.vo.UserVO;
 import org.example.yunpicturebackend.service.PictureService;
 import org.example.yunpicturebackend.mapper.PictureMapper;
 import org.example.yunpicturebackend.service.UserService;
+import org.jsoup.Jsoup;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+import java.io.IOException;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +52,7 @@ import java.util.stream.Collectors;
  * @description 针对表【picture(图片信息表)】的数据库操作Service实现
  * @createDate 2026-06-08 19:33:54
  */
+@Slf4j
 @Service
 public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         implements PictureService{
@@ -133,7 +141,18 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 6. 数据搬运与装配：将上传成功后的 DTO 结果转换为数据库底层能识别的 Entity 实体
         Picture picture = new Picture();
         picture.setUrl(uploadPictureResult.getUrl());
-        picture.setName(uploadPictureResult.getPicName());
+
+        // 6.5 解析与挂载图片名称
+        // 【业务场景】默认情况下，系统会自动从云端返回的元数据或原始物理文件中提取名称作为缺省值。
+        // 但为了支持类似“批量抓取时统一自定义前缀”或“前端用户上传时主动重命名”等高级需求，此处设计了覆盖机制。
+        // 【逻辑说明】优先采用外部扩展请求（pictureUploadRequest）中显式指定的图片名称；
+        // 若外部未传递或传空串，则平滑降级，使用云端上传结果中解析出的默认名称。
+        String picName = uploadPictureResult.getPicName();
+        if (pictureUploadRequest != null && StrUtil.isNotBlank(pictureUploadRequest.getPicName())) {
+            picName = pictureUploadRequest.getPicName();
+        }
+        picture.setName(picName);
+
         picture.setPicSize(uploadPictureResult.getPicSize());
         picture.setPicWidth(uploadPictureResult.getPicWidth());
         picture.setPicHeight(uploadPictureResult.getPicHeight());
@@ -491,6 +510,115 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         }
     }
 
+
+    /**
+     * 批量抓取和创建图片的核心业务实现
+     * <p>
+     * 【业务场景】
+     * 运营人员或管理员需要快速为系统图库扩充特定主题（如“风景”、“头像”）的图片素材。
+     * 本方法通过调用第三方搜索引擎（必应图片异步加载接口），根据用户输入的搜索词，
+     * 自动抓取网页图片元素，并将其清洗、下载、转存到本系统的对象存储（OSS）及数据库中。
+     * </p>
+     * <p>
+     * 【架构考量与设计精要】
+     * 1. 强防御性编程（系统自保机制）：在方法入口处强制设定 `count > 30` 的硬限制。
+     * 批量网络抓取和 I/O 密集型操作极其消耗资源，此举有效防止了恶意调用或误操作导致的
+     * 接口长时间阻塞（Timeout）、服务器内存溢出（OOM），同时极大降低了因高频访问被目标网站封禁 IP 的风险。
+     * 2. 核心逻辑复用 (DRY 原则)：在此方法中，我们只处理“爬虫与数据提取”的特有逻辑，
+     * 而在真正的图片落库阶段，直接循环调用了已有的单图上传方法（`this.uploadPicture`）。
+     * 单图链路中沉淀的“图片下载、格式校验、尺寸解析、OSS 上传、乃至审核参数自动填充”等一系列
+     * 复杂且极具价值的业务规则被完美复用，实现了极高的代码内聚。
+     * 3. 隔离异常与容错机制 (Fault Tolerance)：在批量遍历处理单图时，使用了独立的 `try-catch` 块包裹核心调用。
+     * 外部网络抓取本质上是不可靠的（如：某些图片的源链接已失效、被防盗链拦截等）。
+     * 此设计确保了单张图片的失败（脏数据）只会触发日志记录并跳过，而绝不会中断整个批处理任务（不抛出阻断异常），
+     * 保障了系统在恶劣网络环境下的健壮性和可用性。
+     * 4. 数据清洗与规范化：精准截取 URL 中的 `?` 前置部分，去除了外部引擎生成的缩略图或动态裁剪参数，
+     * 确保系统抓取并转存的是最原始的高质量图片文件。
+     * </p>
+     *
+     * @param pictureUploadByBatchRequest 批量抓取请求参数（含搜索词及预期抓取数量）
+     * @param loginUser                   当前执行操作的登录上下文
+     * @return 最终实际成功抓取并转存入库的图片总数
+     */
+    @Override
+    public Integer uploadPictureByBatch(PictureUploadByBatchRequest pictureUploadByBatchRequest, User loginUser) {
+        // 1. 获取请求参数
+        String searchText = pictureUploadByBatchRequest.getSearchText();
+        // 格式化数量
+        Integer count = pictureUploadByBatchRequest.getCount();
+        // 校验抓取数量，限制最多 30 条，防止单次请求时间过长或被目标网站封禁 IP
+        ThrowUtils.throwIf(count > 30, ErrorCode.PARAMS_ERROR, "最多 30 条");
+
+        // 1.5 解析图片名称前缀
+        // 优先使用前端传入的自定义前缀；若未指定，则优雅降级，默认使用当前搜索词作为图片命名基础
+        String namePrefix = pictureUploadByBatchRequest.getNamePrefix();
+        if (StrUtil.isBlank(namePrefix)) {
+            namePrefix = searchText;
+        }
+
+        // 2. 构造要抓取的目标地址（此处采用必应图片搜索的异步加载接口）
+        String fetchUrl = String.format("https://cn.bing.com/images/async?q=%s&mmasync=1", searchText);
+        Document document;
+        try {
+            // 3. 使用 Jsoup 发送 HTTP GET 请求，获取页面 HTML 文档对象
+            document = Jsoup.connect(fetchUrl).get();
+        } catch (IOException e) {
+            log.error("获取页面失败", e);
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "获取页面失败");
+        }
+
+        // 4. 解析页面内容：找到包裹图片的主容器（必应图片的容器 class 为 dgControl）
+        Element div = document.getElementsByClass("dgControl").first();
+        if (ObjUtil.isNull(div)) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "获取元素失败");
+        }
+
+        // 从主容器中筛选出所有真实图片的 DOM 元素（class 为 mimg）
+        Elements imgElementList = div.select("img.mimg");
+        int uploadCount = 0;
+
+        // 5. 遍历图片元素列表，依次执行上传
+        for (Element imgElement : imgElementList) {
+            // 提取图片的源地址 (src 属性)
+            String fileUrl = imgElement.attr("src");
+            if (StrUtil.isBlank(fileUrl)) {
+                log.info("当前链接为空，已跳过: {}", fileUrl);
+                continue;
+            }
+
+            // 处理图片上传地址，防止出现转义问题（例如去除 URL 后拼接的宽高等 query 参数，保留纯图片后缀）
+            int questionMarkIndex = fileUrl.indexOf("?");
+            if (questionMarkIndex > -1) {
+                fileUrl = fileUrl.substring(0, questionMarkIndex);
+            }
+
+            // 6. 执行单张图片的上传逻辑
+            PictureUploadRequest pictureUploadRequest = new PictureUploadRequest();
+
+            // 6.5 动态组装图片名称
+            if (StrUtil.isNotBlank(namePrefix)) {
+                // 设置图片名称，采用“前缀 + 连续自增序号”的命名规范（例如："风景1", "风景2"），提升图库可读性与检索体验
+                pictureUploadRequest.setPicName(namePrefix + (uploadCount + 1));
+            }
+
+            try {
+                // 复用单张图片上传的方法，将外部图片 URL 转存到我们的系统中
+                PictureVO pictureVO = this.uploadPicture(fileUrl, pictureUploadRequest, loginUser);
+                log.info("图片上传成功, id = {}", pictureVO.getId());
+                uploadCount++; // 记录成功上传的数量
+            } catch (Exception e) {
+                // 遇到单张图片上传失败的情况，仅记录错误日志，并跳过当前循环继续抓取下一张
+                log.error("图片上传失败", e);
+                continue;
+            }
+
+            // 7. 数量控制：一旦成功上传的数量达到用户指定的抓取数量，立即终止循环
+            if (uploadCount >= count) {
+                break;
+            }
+        }
+        return uploadCount;
+    }
 
 
 }
