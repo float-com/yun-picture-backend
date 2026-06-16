@@ -10,6 +10,9 @@ import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
 import org.example.yunpicturebackend.manager.FileManager;
+import org.example.yunpicturebackend.manager.upload.FilePictureUpload;
+import org.example.yunpicturebackend.manager.upload.PictureUploadTemplate;
+import org.example.yunpicturebackend.manager.upload.UrlPictureUpload;
 import org.example.yunpicturebackend.model.dto.file.UploadPictureResult;
 import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
 import org.example.yunpicturebackend.model.dto.picture.PictureReviewRequest;
@@ -46,11 +49,18 @@ import java.util.stream.Collectors;
 public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         implements PictureService{
 
-    @Resource
-    private FileManager fileManager;
+    /*已弃用*/
+//    @Resource
+//    private FileManager fileManager;
 
     @Resource
     private UserService userService;
+
+    @Resource
+    private FilePictureUpload filePictureUpload;
+
+    @Resource
+    private UrlPictureUpload urlPictureUpload;
 
     /**
      * 上传图片（统一处理新增和更新逻辑）
@@ -58,17 +68,17 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
      * 业务流程：
      * 1. 权限校验：确保用户已登录。
      * 2. 更新校验：若携带图片 ID，则防御性校验该记录在数据库中是否存在。
-     * 3. 物理上传：调用底层的 FileManager 将文件安全上传至 COS，并按用户 ID 隔离存储目录。
+     * 3. 云端上传：根据 inputSource 类型选择对应的上传策略（文件或 URL），将图片安全上传至 COS，并按用户 ID 隔离存储目录。
      * 4. 数据装配：提取云端返回的元数据（宽高、大小、格式等）组装数据库实体。
      * 5. 持久化：利用 saveOrUpdate 特性，根据 ID 的有无，自动执行 INSERT 或 UPDATE。
      *
-     * @param multipartFile        前端传入的物理图片文件对象
+     * @param inputSource          图片输入源（支持 MultipartFile 物理文件对象，或 String 类型的图片 URL 地址）
      * @param pictureUploadRequest 图片上传扩展参数（核心用于携带图片 id，区分新增或更新）
      * @param loginUser            当前已认证的登录用户对象
      * @return PictureVO           上传并成功入库后，返回给前端的脱敏视图对象
      */
     @Override
-    public PictureVO uploadPicture(MultipartFile multipartFile, PictureUploadRequest pictureUploadRequest, User loginUser) {
+    public PictureVO uploadPicture(Object inputSource, PictureUploadRequest pictureUploadRequest, User loginUser) {
         // 1. 基础安全拦截：强制要求必须登录后才能执行上传，防范匿名用户恶意传图消耗云端流量和存储
         ThrowUtils.throwIf(loginUser == null, ErrorCode.NO_AUTH_ERROR);
 
@@ -113,8 +123,12 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 优势：实现不同用户间的文件物理隔离，不仅方便排查问题，也有利于后续针对单个用户进行空间配额统计或违规资源清理
         String uploadPathPrefix = String.format("public/%s", loginUser.getId());
 
-        // 5. 调度底层文件管理器，完成向第三方 COS 的安全上传与图片元数据（CI）解析
-        UploadPictureResult uploadPictureResult = fileManager.uploadPicture(multipartFile, uploadPathPrefix);
+        // 5. 根据 inputSource 的类型动态调度底层的文件或URL上传策略，完成向第三方 COS 的安全上传与图片元数据（CI）解析
+        PictureUploadTemplate pictureUploadTemplate = filePictureUpload;
+        if(inputSource instanceof String){
+            pictureUploadTemplate = urlPictureUpload;
+        }
+        UploadPictureResult uploadPictureResult = pictureUploadTemplate.uploadPicture(inputSource, uploadPathPrefix);
 
         // 6. 数据搬运与装配：将上传成功后的 DTO 结果转换为数据库底层能识别的 Entity 实体
         Picture picture = new Picture();

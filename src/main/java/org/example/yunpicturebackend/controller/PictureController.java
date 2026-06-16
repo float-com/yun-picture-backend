@@ -83,6 +83,41 @@ public class PictureController {
         return ResultUtils.success(pictureVO);
     }
 
+    /**
+     * 通过 URL 上传图片（统一处理新增和重新上传替换）
+     * <p>
+     * 业务场景：用户提供网络图片的公网 URL，系统将其抓取并转存到自己的云存储中。
+     * 既支持全新的抓取上传，也支持对已存在图片记录的物理文件进行更新替换。
+     * <p>
+     * 【设计原理】参数绑定：
+     * 这里必须在 PictureUploadRequest 前使用 @RequestBody。因为前端是以 application/json 格式提交的数据
+     * （而非 multipart/form-data），Spring MVC 需要借助 HttpMessageConverter 将请求体中的 JSON 字符串反序列化为 Java 对象。
+     *
+     * @param pictureUploadRequest 前端提交的 JSON 格式请求参数，核心包含待抓取的网络图片地址 fileUrl，以及可选的 id 字段（用于区分是“全新上传”还是“更新替换”）。
+     * @param request              Servlet 原生 HTTP 请求对象，用于从中提取当前会话（Session）或 Token，进而获取登录态。
+     * @return 统一返回体包装的 PictureVO 视图对象，包含转存后的公网访问 URL 和各项解析出来的元数据。
+     */
+    @PostMapping("/upload/url")
+    public BaseResponse<PictureVO> uploadPictureByUrl(
+            @RequestBody PictureUploadRequest pictureUploadRequest,
+            HttpServletRequest request) {
+
+        // 1. 获取当前登录用户信息（基于 HTTP Session 或 Token）
+        // 如果未登录，底层的 getLoginUser 会抛出未授权异常，交由全局异常处理器拦截处理
+        User loginUser = userService.getLoginUser(request);
+
+        // 2. 从请求体中提取网络图片的公网链接
+        String fileUrl = pictureUploadRequest.getFileUrl();
+
+        // 3. 调度 Service 层执行核心上传及入库逻辑
+        // 此处将 URL 字符串作为 inputSource 传入，底层方法会根据输入源类型自动适配 URL 抓取策略，完成云端转存与数据库持久化
+        PictureVO pictureVO = pictureService.uploadPicture(fileUrl, pictureUploadRequest, loginUser);
+
+        // 4. 将最终生成的脱敏视图对象包装为全局统一的标准 JSON 格式并返回
+        return ResultUtils.success(pictureVO);
+    }
+
+
 
 
     /**

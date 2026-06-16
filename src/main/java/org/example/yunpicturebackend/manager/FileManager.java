@@ -28,6 +28,13 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 
+
+
+/*
+* @deprecated 已废弃，改为使用 upload 包的模版方法优化
+* */
+@Deprecated
+
 /**
  * 通用文件管理服务（Service 层）
  * <p>
