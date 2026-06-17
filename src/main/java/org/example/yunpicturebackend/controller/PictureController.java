@@ -1,7 +1,10 @@
 package org.example.yunpicturebackend.controller;
 
+import cn.hutool.core.util.RandomUtil;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.extern.slf4j.Slf4j;
 import org.example.yunpicturebackend.annotation.AuthCheck;
 import org.example.yunpicturebackend.common.BaseResponse;
@@ -20,6 +23,9 @@ import org.example.yunpicturebackend.model.vo.PictureVO;
 import org.example.yunpicturebackend.service.PictureService;
 import org.example.yunpicturebackend.service.UserService;
 import org.springframework.beans.BeanUtils;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.util.DigestUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -28,6 +34,7 @@ import javax.servlet.http.HttpServletRequest;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 
 /**
@@ -49,6 +56,41 @@ public class PictureController {
 
     @Resource
     private PictureService pictureService;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * 构建 JVM 级本地缓存 (L1 Cache)
+     * <p>
+     * 【架构演进：为什么在 Redis 之外还需要本地缓存？】
+     * 在极高并发（如秒杀、C端首页高频拉取）场景下，纵然有 Redis (L2 Cache) 加持，网络 I/O 的开销
+     * 以及 Redis 集群面对“极端热点 Key”时的性能瓶颈依然存在。
+     * 引入基于 Caffeine（当前 Java 生态下性能天花板的本地缓存框架）的 JVM 缓存，
+     * 能够将部分高频读请求直接拦截在应用服务器（Tomcat）内部，实现“纳秒级”的极致响应，彻底解放 Redis 与 MySQL。
+     * </p>
+     */
+    private final Cache<String, String> LOCAL_CACHE = Caffeine.newBuilder()
+            // 【性能调优：内存预分配】
+            // 设置底层哈希表的初始容量。在系统刚启动或突发流量涌入时，能有效避免
+            // 因底层结构频繁扩容（Rehash）而导致的性能抖动和 CPU 资源消耗。
+            .initialCapacity(1024)
+
+            // 【系统自保：防 OOM (内存溢出) 机制】
+            // 强制设定当前 JVM 堆内存中最多允许驻留的缓存条目数上限为 1 万条。
+            // 当数据量逼近阈值时，Caffeine 会基于其强大的 W-TinyLFU 算法，
+            // 极其精准地剔除“冷数据”和“低频数据”，确保应用服务永远不会因缓存无限膨胀而崩溃。
+            .maximumSize(10000L)
+
+            // 【数据一致性与空间回收】
+            // 采用“写入后绝对过期”的淘汰策略（TTL 为 5 分钟）。
+            // 业务考量：在“高性能”与“强一致性”之间取得平衡。容忍业务数据存在最多 5 分钟的延迟（伪静态化），
+            // 同时确保那些曾经是热点、但现在已无人问津的数据能够自动释放，归还宝贵的内存空间。
+            .expireAfterWrite(5L, TimeUnit.MINUTES)
+
+            // 构建并初始化缓存实例
+            .build();
+
 
     /**
      * 上传图片（统一处理新增和重新上传替换）
@@ -281,7 +323,7 @@ public class PictureController {
 
     /**
      * 分页获取图片视图列表接口（供 C 端普通用户使用）
-     *
+     * 现在暂不使用当前接口【改为使用listPictureVOByPageWithCatch这个多级缓存架构的查询接口】
      * 为什么分出 /page 和 /page/vo 两个接口？
      * 架构考量：读写分离原则。后台管理员需要看底层全量字段（如物理文件路径、逻辑删除标识等），调 /page；
      * C 端用户只需要看展示信息，调 /page/vo，后者会在 Service 层经过严格的脱敏和关联用户信息处理，防止数据泄露。
@@ -314,6 +356,233 @@ public class PictureController {
         // 在 getPictureVOPage 方法内部，不仅会将 Picture 转换为 PictureVO，
         // 还会采用批量查询的方式查出所有作者信息并组装，保证高性能的视图渲染。
         return ResultUtils.success(pictureService.getPictureVOPage(picturePage, request));
+    }
+
+    /**
+     * 分页获取图片视图列表接口（供 C 端普通用户使用）[Redis缓存架构]
+     * <p>
+     * 【架构考量：为什么引入 Redis 缓存？】
+     * C 端首页的图片展示是典型的高频读、低频写的“热点接口”。如果任由海量并发请求直接打穿到 MySQL，
+     * 执行复杂的条件过滤和分页查询，极易导致数据库 CPU 飙升甚至宕机。
+     * 引入 Redis 作为前置缓冲层，能实现百倍级的性能提升（QPS）并大幅降低响应延迟。
+     * </p>
+     *
+     * @param pictureQueryRequest 包含分页参数和复杂检索条件的 DTO
+     * @param request             用于提取当前登录态
+     * @return 包含脱敏数据分页对象 (Page<PictureVO>) 的统一响应体
+     */
+    @PostMapping("/list/page/vo/Redis")
+    public BaseResponse<Page<PictureVO>> listPictureVOByPageWithRedis(
+            @RequestBody PictureQueryRequest pictureQueryRequest,
+            HttpServletRequest request) {
+
+        long current = pictureQueryRequest.getCurrent();
+        long size = pictureQueryRequest.getPageSize();
+
+        // 1. 安全防御：防止恶意爬虫
+        // 如果不限制 size，黑客可能发送 size=100000 的请求，一次性拉取全库数据，导致服务器 OOM (内存溢出) 或数据库崩溃。
+        ThrowUtils.throwIf(size > 20, ErrorCode.PARAMS_ERROR);
+
+        // 2. 权限隔离：普通用户可见性控制
+        // 新增：普通用户默认只能查看已过审的数据【非常重要的越权防御】
+        pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
+
+        // 3. 构建分布式缓存 Key (Cache Key Generation)
+        // 策略：将用户动态提交的查询条件（DTO）完整序列化为 JSON 字符串。
+        // 优化：由于 JSON 字符串可能极长，直接作为 Redis Key 会严重浪费内存且影响匹配效率。
+        // 因此使用 MD5 算法对其进行信息摘要，生成 32 位固定长度的十六进制 Hash 字符串。
+        String queryCondition = JSONUtil.toJsonStr(pictureQueryRequest);
+        String hashKey = DigestUtils.md5DigestAsHex(queryCondition.getBytes());
+        String redisKey = "yunpicture:listPictureVOByPage:" + hashKey;
+
+        // 4. 读缓存 (Read-Through)
+        // 尝试从 Redis 中获取已缓存的当前页数据
+        ValueOperations<String, String> valueOps = stringRedisTemplate.opsForValue();
+        String cachedValue = valueOps.get(redisKey);
+        if (cachedValue != null) {
+            // 缓存命中 (Cache Hit)：直接反序列化为 Page 对象并短路返回，彻底解放底层数据库。
+            Page<PictureVO> cachedPage = JSONUtil.toBean(cachedValue, Page.class);
+            return ResultUtils.success(cachedPage);
+        }
+
+        // 5. 回源查询底层数据 (Cache Miss)
+        // 缓存未命中时，委托给 Service 层，将 DTO 解析为 MyBatis-Plus 的 QueryWrapper 动态 SQL 语句，查出原始物理模型。
+        Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
+                pictureService.getQueryWrapper(pictureQueryRequest));
+
+        // 6. 视图模型装配 (解决 N+1 问题)
+        // 将底层的 Picture 转换为对外展示的 PictureVO，内部会批量查询并装配作者等关联信息。
+        Page<PictureVO> pictureVOPage = pictureService.getPictureVOPage(picturePage,request);
+
+        // 7. 写缓存 (Write-back) 与 容错保护机制
+        String cacheValue = JSONUtil.toJsonStr(pictureVOPage);
+        // 【架构考量：防缓存雪崩 (Cache Avalanche)】
+        // 策略：基础过期时间（300秒，即5分钟） + 随机扰动时间（0-300秒）。
+        // 目的：打散这批缓存的过期节点，保证总 TTL 在 5~10 分钟之间浮动。
+        // 避免同一时间点大量高并发的缓存 Key 同时失效，导致瞬间所有请求全部涌向 MySQL 引发雪崩。
+        int cacheExpireTime = 300 +  RandomUtil.randomInt(0, 300);
+        valueOps.set(redisKey, cacheValue, cacheExpireTime, TimeUnit.SECONDS);
+
+        // 8. 返回最终视图
+        return ResultUtils.success(pictureVOPage);
+    }
+
+    /**
+     * 分页获取图片视图列表接口（供 C 端普通用户使用）[纯本地缓存架构版]
+     * <p>
+     * 【架构演进：为什么从 Redis 降级/切换为本地缓存？】
+     * 在极端的“读多写少”且“数据一致性要求不高”的场景下（例如 C 端默认首页的推荐流），
+     * 即便是 Redis 的网络 I/O 延迟和序列化开销也可能成为性能瓶颈。
+     * 引入基于 JVM 内存的本地缓存（如 Caffeine，L1 Cache），能实现无网络损耗的“纳秒级”响应，
+     * 作为系统的第一道防线，将绝大部分高频且重复的分页请求直接拦截在应用实例内部。
+     * </p>
+     *
+     * @param pictureQueryRequest 包含分页参数和复杂检索条件的 DTO
+     * @param request             用于提取当前登录态
+     * @return 包含脱敏数据分页对象 (Page<PictureVO>) 的统一响应体
+     */
+    @PostMapping("/list/page/vo/LocalCache")
+    public BaseResponse<Page<PictureVO>> listPictureVOByPageWithLocalCache(
+            @RequestBody PictureQueryRequest pictureQueryRequest,
+            HttpServletRequest request) {
+
+        long current = pictureQueryRequest.getCurrent();
+        long size = pictureQueryRequest.getPageSize();
+
+        // 1. 安全防御：防止恶意爬虫与内存雪崩
+        // 强制限制单页最大拉取数量。若不加限制，黑客请求 size=100000 极易引发跨网络海量数据传输，
+        // 进而导致数据库崩溃或当前 JVM 实例 OOM（内存溢出）。
+        ThrowUtils.throwIf(size > 20, ErrorCode.PARAMS_ERROR);
+
+        // 2. 权限隔离：数据可见性控制
+        // 【核心越权防御】强行覆盖前端传入的状态码，确保普通用户永远只能看到“已过审(PASS)”的健康内容。
+        pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
+
+        // 3. 构建本地缓存 Key (Cache Key Generation)
+        // 策略：将动态检索条件 DTO 序列化为 JSON。
+        // 内存调优：由于 JSON 字符串较长，直接作为 Key 会极大地消耗宝贵的 JVM 堆内存。
+        // 此处采用 MD5 算法进行信息摘要，生成 32 位固定长度的十六进制字符串，兼顾了唯一性与极高的内存利用率。
+        String queryCondition = JSONUtil.toJsonStr(pictureQueryRequest);
+        String hashKey = DigestUtils.md5DigestAsHex(queryCondition.getBytes());
+        String cacheKey = "listPictureVOByPage:" + hashKey;
+
+        // 4. 探查一级缓存 (L1 Cache Read-Through)
+        // 尝试直接从本地内存（Caffeine）中读取缓存的分页数据
+        String cachedValue = LOCAL_CACHE.getIfPresent(cacheKey);
+        if (cachedValue != null) {
+            // 【缓存命中 (Cache Hit)】：直接反序列化为 Page 对象并短路返回，全流程零数据库/网络 I/O 消耗。
+            Page<PictureVO> cachedPage = JSONUtil.toBean(cachedValue, Page.class);
+            return ResultUtils.success(cachedPage);
+        }
+
+        // 5. 回源查询底层数据 (Cache Miss)
+        // 缓存未命中时，委托给 Service 层，将 DTO 解析为 MyBatis-Plus 的 QueryWrapper 动态 SQL 语句，查出原始物理模型。
+        Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
+                pictureService.getQueryWrapper(pictureQueryRequest));
+
+        // 6. 视图模型装配 (解决 N+1 问题)
+        // 将底层的 Picture 转换为对外展示的 PictureVO，内部会批量查询并装配作者等关联信息。
+        Page<PictureVO> pictureVOPage = pictureService.getPictureVOPage(picturePage,request);
+
+        // 7. 写入本地缓存 (Write-back)
+        String cacheValue = JSONUtil.toJsonStr(pictureVOPage);
+
+        // 将最新组装好的分页视图 JSON 塞入本地内存，生命周期由 Caffeine 后台线程静默接管
+        LOCAL_CACHE.put(cacheKey, cacheValue);
+
+        // 8. 返回最终视图
+        return ResultUtils.success(pictureVOPage);
+    }
+
+
+
+
+    /**
+     * 分页获取图片视图列表接口（供 C 端普通用户使用）[多级缓存架构版]
+     * <p>
+     * 【架构演进：为什么引入 多级缓存 (L1 Caffeine + L2 Redis)？】
+     * 1. 极致性能 (L1)：C端首页的流量极其庞大。将高频访问的首页数据缓存在 JVM 内存 (Caffeine) 中，
+     * 可实现真正的“零网络损耗”和“纳秒级”响应，作为抵御洪峰的第一道防线。
+     * 2. 分布式共享与容底 (L2)：本地缓存容量有限且各节点不共享。当 L1 未命中时，请求下沉到 Redis。
+     * Redis 作为二级缓存，容量更大且全集群共享，避免所有应用节点的穿透请求直接打垮 MySQL。
+     * 3. 动态回填机制：当 Redis 命中时，自动将数据回写到 L1，实现热点数据的自适应预热。
+     * </p>
+     *
+     * @param pictureQueryRequest 包含分页参数和复杂检索条件的 DTO
+     * @param request             用于提取当前登录态
+     * @return 包含脱敏数据分页对象 (Page<PictureVO>) 的统一响应体
+     */
+    @PostMapping("/list/page/vo/cache")
+    public BaseResponse<Page<PictureVO>> listPictureVOByPageWithCatch(
+            @RequestBody PictureQueryRequest pictureQueryRequest,
+            HttpServletRequest request) {
+
+        long current = pictureQueryRequest.getCurrent();
+        long size = pictureQueryRequest.getPageSize();
+
+        // 1. 安全防御：防止恶意爬虫
+        // 强制限制拉取数量，防止黑客通过 size=100000 引发跨网络海量数据传输，导致 OOM 或 DB 崩溃。
+        ThrowUtils.throwIf(size > 20, ErrorCode.PARAMS_ERROR);
+
+        // 2. 权限隔离：数据可见性控制
+        // 普通用户默认只能查看已过审的数据【核心越权防御】
+        pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
+
+        // 3. 构建多级缓存共享 Key (Cache Key Generation)
+        // 将 DTO 序列化并进行 MD5 摘要，生成 32 位固定长度 Hash，兼顾唯一性与内存利用率。
+        String queryCondition = JSONUtil.toJsonStr(pictureQueryRequest);
+        String hashKey = DigestUtils.md5DigestAsHex(queryCondition.getBytes());
+        String cacheKey = "yunpicture:listPictureVOByPage:" + hashKey;
+
+        // =========================================================
+        // 多级缓存核心链路开始 (L1 -> L2 -> DB)
+        // =========================================================
+
+        // 4. 探查一级缓存 (L1 Cache - Caffeine)
+        // 第一道防线：纯内存读取，无网络 I/O 损耗
+        String cachedValue = LOCAL_CACHE.getIfPresent(cacheKey);
+        if (cachedValue != null) {
+            // 命中 L1：直接反序列化并短路返回，性能达到极致
+            Page<PictureVO> cachedPage = JSONUtil.toBean(cachedValue, Page.class);
+            return ResultUtils.success(cachedPage);
+        }
+
+        // 5. 探查二级缓存 (L2 Cache - Redis)
+        // 第二道防线：跨节点共享缓存
+        ValueOperations<String, String> valueOps = stringRedisTemplate.opsForValue();
+        cachedValue = valueOps.get(cacheKey);
+        if (cachedValue != null) {
+            // 命中 L2：说明该数据是热点，但在当前 JVM 实例的 L1 中已过期或未被加载过。
+            // 【缓存预热/回写】：立即将数据塞入当前节点的 L1，保护 Redis 免受后续同类高频请求冲击。
+            LOCAL_CACHE.put(cacheKey, cachedValue);
+
+            Page<PictureVO> cachedPage = JSONUtil.toBean(cachedValue, Page.class);
+            return ResultUtils.success(cachedPage);
+        }
+
+        // 6. 回源查询数据库 (Cache Miss - MySQL)
+        // 前两级缓存均告破，请求真正触达底层数据库
+        Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
+                pictureService.getQueryWrapper(pictureQueryRequest));
+
+        // 视图模型装配 (解决 N+1 问题)
+        Page<PictureVO> pictureVOPage = pictureService.getPictureVOPage(picturePage, request);
+
+        // 7. 缓存双写与容错保护 (Write-back L1 & L2)
+        String cacheValue = JSONUtil.toJsonStr(pictureVOPage);
+
+        // 7.1 更新 L1 缓存（生命周期由 Caffeine 初始化配置的 TTL 接管）
+        LOCAL_CACHE.put(cacheKey, cacheValue);
+
+        // 7.2 更新 L2 缓存
+        // 【架构考量：防缓存雪崩 (Cache Avalanche)】
+        // 即使采用多级缓存，仍需保留过期时间随机扰动机制（基础 5 分钟 + 0~5分钟随机波动）。
+        // 强力打散 Redis 中大批热点 Key 的集体失效时间，防止极端情况下瞬间打穿到底层 MySQL。
+        int cacheExpireTime = 300 + RandomUtil.randomInt(0, 300);
+        valueOps.set(cacheKey, cacheValue, cacheExpireTime, TimeUnit.SECONDS);
+
+        // 8. 返回最终视图
+        return ResultUtils.success(pictureVOPage);
     }
 
     /**

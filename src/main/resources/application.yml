@@ -20,6 +20,22 @@ spring:
     username: root  # 数据库用户名
     password: ${YUN_PICTURE_DB_PASSWORD}  # 数据库密码，从环境变量读取，避免提交明文密码
 
+  # Redis 配置
+  redis:
+    database: 0  # Redis 数据库索引（默认为 0）
+    host: 127.0.0.1  # Redis 服务器连接地址
+    port: 6379  # Redis 服务端口号
+    timeout: 5000  # 连接超时时间（单位：毫秒）
+
+  # Spring Boot 环境隔离配置 (Profiles)
+  profiles:
+    # 指定当前激活的运行环境为 local (本地开发环境)。
+    # 启动时，框架会自动寻找并加载同目录下的 application-local.yml 文件，
+    # 用于覆盖或补充当前主配置文件的参数。
+    active: local
+
+
+
 # MyBatis-Plus 框架配置（MyBatis 增强工具，简化 CRUD）
 mybatis-plus:
   # MyBatis 原生配置
