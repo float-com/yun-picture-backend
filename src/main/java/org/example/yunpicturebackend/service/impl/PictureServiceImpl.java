@@ -1,11 +1,15 @@
 package org.example.yunpicturebackend.service.impl;
 
 import cn.hutool.core.collection.CollUtil;
+import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.ObjUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.extern.slf4j.Slf4j;
 import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
@@ -29,7 +33,10 @@ import org.example.yunpicturebackend.mapper.PictureMapper;
 import org.example.yunpicturebackend.service.UserService;
 import org.jsoup.Jsoup;
 import org.springframework.beans.BeanUtils;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.stereotype.Service;
+import org.springframework.util.DigestUtils;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
@@ -42,6 +49,7 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -65,10 +73,29 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
     private UserService userService;
 
     @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
     private FilePictureUpload filePictureUpload;
 
     @Resource
     private UrlPictureUpload urlPictureUpload;
+
+    /**
+     * 构建 JVM 级本地缓存 (L1 Cache)
+     * <p>
+     * 业务场景：图片分页列表属于典型的读多写少、高频访问接口。将热点分页结果缓存在当前应用实例内存中，
+     * 可以在 Redis 之前先拦截一批重复请求，减少网络 I/O 与二级缓存压力。
+     * </p>
+     */
+    private final Cache<String, String> LOCAL_CACHE = Caffeine.newBuilder()
+            // 初始容量：为常见热点分页请求预留空间，降低运行期扩容带来的性能抖动
+            .initialCapacity(1024)
+            // 最大容量：限制 JVM 内存占用，避免缓存条目无限增长导致 OOM
+            .maximumSize(10000L)
+            // 写入后过期：与当前 Controller 中的多级缓存策略保持一致，兼顾性能与数据时效性
+            .expireAfterWrite(5L, TimeUnit.MINUTES)
+            .build();
 
     /**
      * 上传图片（统一处理新增和更新逻辑）
@@ -348,6 +375,157 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
         return pictureVOPage;
     }
+
+//=================================================================================================
+    /**
+     * 分页获取图片视图列表（多级缓存版）
+     * <p>
+     * 业务场景：适用于 C 端首页和空间图片列表等高频读接口。
+     * 将参数校验、权限兜底、多级缓存（L1+L2）、数据库回源、VO 装配及缓存回写等完整链路下沉至 Service 层，
+     * 使 Controller 层专注请求接收与统一响应。
+     * </p>
+     *
+     * @param pictureQueryRequest 图片分页查询请求参数
+     * @param request             HTTP 请求对象（用于复用现有的 VO 装配逻辑）
+     * @return Page<PictureVO>    脱敏后的图片分页视图
+     */
+    @Override
+    public Page<PictureVO> listPictureVOByPageWithCache(PictureQueryRequest pictureQueryRequest, HttpServletRequest request) {
+        // 1. 基础参数校验：防止异常超大分页请求穿透至底层
+        validatePicturePageQueryRequest(pictureQueryRequest);
+
+        long current = pictureQueryRequest.getCurrent();
+        long size = pictureQueryRequest.getPageSize();
+
+        // 2. 权限隔离：C 端查询默认仅展示已过审图片
+        // 注意：必须在生成缓存 Key 前设置状态，保证同一业务场景生成的缓存 Key 一致
+        pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
+
+        // 3. 构建多级缓存共享 Key
+        String cacheKey = buildPictureVOPageCacheKey(pictureQueryRequest);
+
+        // 4. 优先读取多级缓存（L1 Caffeine -> L2 Redis）
+        Page<PictureVO> cachedPictureVOPage = getCachedPictureVOPage(cacheKey);
+        if (cachedPictureVOPage != null) {
+            return cachedPictureVOPage;
+        }
+
+        // 5. 缓存未命中，回源查询数据库
+        Page<Picture> picturePage = this.page(new Page<>(current, size),
+                this.getQueryWrapper(pictureQueryRequest));
+
+        // 6. 装配分页 VO：复用现有逻辑，完成用户信息等字段的批量填充
+        Page<PictureVO> pictureVOPage = this.getPictureVOPage(picturePage, request);
+
+        // 7. 缓存回写：写入 L1 与 L2 缓存，供后续相同查询命中
+        savePictureVOPageCache(cacheKey, pictureVOPage);
+
+        return pictureVOPage;
+    }
+
+    /**
+     * 校验图片分页查询参数
+     * <p>
+     * 目的：由于多级缓存接口可能被内部其他调用方复用，在此保留分页大小限制，
+     * 防止异常调用绕过 Controller 导致数据库、Redis 或 JVM 内存过载。
+     * </p>
+     *
+     * @param pictureQueryRequest 图片分页查询请求参数
+     */
+    private void validatePicturePageQueryRequest(PictureQueryRequest pictureQueryRequest) {
+        // 校验请求参数对象是否为空，防止后续取值时引发空指针异常 (NullPointerException)
+        ThrowUtils.throwIf(pictureQueryRequest == null, ErrorCode.PARAMS_ERROR);
+        // 获取当前请求的单页记录条数（分页大小）
+        long size = pictureQueryRequest.getPageSize();
+        // 限制单次查询的分页大小上限为 20 条，防止单次加载过多数据压垮内存及拖慢查询速度
+        ThrowUtils.throwIf(size > 20, ErrorCode.PARAMS_ERROR);
+    }
+
+    /**
+     * 构建图片分页 VO 的多级缓存共享 Key
+     * <p>
+     * 设计思路：
+     * 1. JSON 序列化：确保分页、排序、搜索词、分类等完整查询条件均参与缓存隔离。
+     * 2. MD5 摘要：将长串 JSON 压缩为固定长度的 Key，避免 Redis 存储及网络传输开销过大。
+     * </p>
+     *
+     * @param pictureQueryRequest 已补齐默认查询约束的请求参数
+     * @return 唯一的缓存 Key 字符串
+     */
+    private String buildPictureVOPageCacheKey(PictureQueryRequest pictureQueryRequest) {
+        // 将包含分页、排序、筛选等所有查询条件的请求对象统一序列化为 JSON 字符串
+        String queryCondition = JSONUtil.toJsonStr(pictureQueryRequest);
+        // 将冗长的 JSON 字符串转换为字节数组，并使用 MD5 算法生成 32 位的十六进制哈希值，以此压缩 Key 的长度
+        String hashKey = DigestUtils.md5DigestAsHex(queryCondition.getBytes());
+        // 拼接业务模块前缀与生成的哈希值，返回最终用于 L1 本地缓存和 L2 Redis 缓存的共享 Key
+        return "yunpicture:listPictureVOByPage:" + hashKey;
+    }
+
+    /**
+     * 读取图片分页 VO 多级缓存
+     * <p>
+     * 命中策略：
+     * 1. 查 L1 本地缓存（Caffeine），命中即返回。
+     * 2. 未命中查 L2 分布式缓存（Redis）。
+     * 3. 若 L2 命中，将其回填至 L1 缓存，提升后续同类请求在当前 JVM 节点的响应速度。
+     * </p>
+     *
+     * @param cacheKey 缓存 Key
+     * @return 命中的分页视图；未命中时返回 null
+     */
+    private Page<PictureVO> getCachedPictureVOPage(String cacheKey) {
+        // 尝试从 L1 本地缓存 (如 Caffeine) 中读取对应 Key 的值
+        String cachedValue = LOCAL_CACHE.getIfPresent(cacheKey);
+
+        // 如果 L1 缓存命中（值不为空）
+        if (cachedValue != null) {
+            // 直接将缓存的 JSON 字符串反序列化为 Page 对象并返回，终止后续查询
+            return JSONUtil.toBean(cachedValue, Page.class);
+        }
+
+        // L1 缓存未命中，获取 Redis 字符串类型的操作对象，准备查询 L2 缓存
+        ValueOperations<String, String> valueOps = stringRedisTemplate.opsForValue();
+
+        // 尝试从 L2 分布式缓存 (Redis) 中读取对应 Key 的值
+        cachedValue = valueOps.get(cacheKey);
+
+        // 如果 L2 缓存命中（值不为空）
+        if (cachedValue != null) {
+            // 将 Redis 中读取到的热点数据回填到当前 JVM 的 L1 本地缓存中
+            LOCAL_CACHE.put(cacheKey, cachedValue);
+            // 将 JSON 字符串反序列化为 Page 对象并返回
+            return JSONUtil.toBean(cachedValue, Page.class);
+        }
+
+        // 如果 L1 和 L2 缓存均未命中，返回 null，提示上层业务需要回源查询数据库
+        return null;
+    }
+
+    /**
+     * 写入图片分页 VO 多级缓存
+     * <p>
+     * 写入策略：
+     * 1. 同步写入 L1（Caffeine）与 L2（Redis）。
+     * 2. 防雪崩处理：L2 Redis 在基础过期时间上增加随机抖动，避免大量热点 Key 在同一时刻集中失效引发缓存雪崩。
+     * </p>
+     *
+     * @param cacheKey      缓存 Key
+     * @param pictureVOPage 组装完成的分页结果数据
+     */
+    private void savePictureVOPageCache(String cacheKey, Page<PictureVO> pictureVOPage) {
+        // 将装配完成的图片分页视图对象序列化为 JSON 字符串，以便存储
+        String cacheValue = JSONUtil.toJsonStr(pictureVOPage);
+        // 同步将数据写入 L1 本地缓存（其过期时间由初始化本地缓存时的全局配置决定）
+        LOCAL_CACHE.put(cacheKey, cacheValue);
+        // 获取 Redis 字符串类型的操作对象，准备写入 L2 缓存
+        ValueOperations<String, String> valueOps = stringRedisTemplate.opsForValue();
+        // 计算 Redis 缓存过期时间：基础时间 300 秒（5分钟） + 0 到 300 秒的随机抖动时间
+        // 这样做是为了防止大量同类缓存记录在同一时间失效，导致数据库瞬间面临巨大的回源压力（缓存雪崩）
+        int cacheExpireTime = 300 + RandomUtil.randomInt(0, 300);
+        // 将数据写入 L2 缓存 (Redis)，并设置带有随机抖动的过期时间
+        valueOps.set(cacheKey, cacheValue, cacheExpireTime, TimeUnit.SECONDS);
+    }
+    //=================================================================================================
 
 
     /**

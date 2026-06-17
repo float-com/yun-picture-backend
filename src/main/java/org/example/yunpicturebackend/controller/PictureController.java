@@ -360,6 +360,7 @@ public class PictureController {
 
     /**
      * 分页获取图片视图列表接口（供 C 端普通用户使用）[Redis缓存架构]
+     * 此接口仅用于演示Redis缓存优化，不投入项目使用。
      * <p>
      * 【架构考量：为什么引入 Redis 缓存？】
      * C 端首页的图片展示是典型的高频读、低频写的“热点接口”。如果任由海量并发请求直接打穿到 MySQL，
@@ -429,6 +430,7 @@ public class PictureController {
 
     /**
      * 分页获取图片视图列表接口（供 C 端普通用户使用）[纯本地缓存架构版]
+     * 此接口仅用于演示本地缓存优化，不投入项目使用。
      * <p>
      * 【架构演进：为什么从 Redis 降级/切换为本地缓存？】
      * 在极端的“读多写少”且“数据一致性要求不高”的场景下（例如 C 端默认首页的推荐流），
@@ -499,6 +501,7 @@ public class PictureController {
 
     /**
      * 分页获取图片视图列表接口（供 C 端普通用户使用）[多级缓存架构版]
+     * 此接口已废弃，其核心业务逻辑已重构并下沉至 Service 层统一管理。
      * <p>
      * 【架构演进：为什么引入 多级缓存 (L1 Caffeine + L2 Redis)？】
      * 1. 极致性能 (L1)：C端首页的流量极其庞大。将高频访问的首页数据缓存在 JVM 内存 (Caffeine) 中，
@@ -512,7 +515,7 @@ public class PictureController {
      * @param request             用于提取当前登录态
      * @return 包含脱敏数据分页对象 (Page<PictureVO>) 的统一响应体
      */
-    @PostMapping("/list/page/vo/cache")
+    //@PostMapping("/list/page/vo/cache")
     public BaseResponse<Page<PictureVO>> listPictureVOByPageWithCatch(
             @RequestBody PictureQueryRequest pictureQueryRequest,
             HttpServletRequest request) {
@@ -582,6 +585,27 @@ public class PictureController {
         valueOps.set(cacheKey, cacheValue, cacheExpireTime, TimeUnit.SECONDS);
 
         // 8. 返回最终视图
+        return ResultUtils.success(pictureVOPage);
+    }
+
+    /**
+     * 分页获取图片视图列表（C 端多级缓存版）
+     * <p>
+     * 架构说明：
+     * 遵循控制层与业务层职责分离的设计原则。Controller 层仅负责请求接收与统一响应封装；
+     * L1/L2 多级缓存读取、数据库回源、VO 数据组装及缓存回写等完整业务链路均下沉至 Service 层，
+     * 从而有效降低层级耦合，提升代码的可复用性、可测试性与后续维护效率。
+     * </p>
+     *
+     * @param pictureQueryRequest 包含分页参数与复杂筛选条件的查询请求 DTO
+     * @param request             HTTP 请求对象（用于提取当前用户登录态参与 VO 装配）
+     * @return BaseResponse       统一响应体，包含脱敏后的图片分页视图对象 (Page<PictureVO>)
+     */
+    @PostMapping("/list/page/vo/cache")
+    public BaseResponse<Page<PictureVO>> listPictureVOByPageWithCache(
+            @RequestBody PictureQueryRequest pictureQueryRequest,
+            HttpServletRequest request) {
+        Page<PictureVO> pictureVOPage = pictureService.listPictureVOByPageWithCache(pictureQueryRequest, request);
         return ResultUtils.success(pictureVOPage);
     }
 

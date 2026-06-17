@@ -81,6 +81,19 @@ public interface PictureService extends IService<Picture> {
     Page<PictureVO> getPictureVOPage(Page<Picture> picturePage, HttpServletRequest request);
 
     /**
+     * 分页获取图片视图列表（多级缓存版）
+     * <p>
+     * 业务场景：面向 C 端首页、空间图片列表等高频读场景，在保持原有分页、搜索和 VO 装配能力的前提下，
+     * 优先使用 JVM 本地缓存 (L1) 承接热点请求，再使用 Redis (L2) 承接跨节点共享数据，最后才回源数据库。
+     * </p>
+     *
+     * @param pictureQueryRequest 图片分页查询请求参数
+     * @param request             HTTP 请求对象（用于 VO 装配时继续复用原有登录上下文）
+     * @return Page<PictureVO> 包含脱敏图片信息的分页视图结果
+     */
+    Page<PictureVO> listPictureVOByPageWithCache(PictureQueryRequest pictureQueryRequest, HttpServletRequest request);
+
+    /**
      * 校验图片参数的合法性
      * <p>
      * 业务场景：在图片信息入库或更新前调用，确保实体对象的核心字段（如主键、文本长度等）满足数据库约束与业务规范。
