@@ -1,7 +1,9 @@
 package org.example.yunpicturebackend.manager;
 
 import cn.hutool.core.io.FileUtil;
+import cn.hutool.core.util.StrUtil;
 import com.qcloud.cos.COSClient;
+import com.qcloud.cos.exception.CosClientException;
 import com.qcloud.cos.model.COSObject;
 import com.qcloud.cos.model.GetObjectRequest;
 import com.qcloud.cos.model.PutObjectRequest;
@@ -107,7 +109,10 @@ public class CosManager {
         // 4.1 定义图片格式转换（压缩为 WebP 格式）规则
         // 参考官网地址：https://cloud.tencent.com/document/product/436/113299 生成
         // 业务说明：WebP 格式能在保持较高视觉质量的同时大幅减小文件体积，非常适合作为图库的展示或缩略图，以节省 CDN 流量
-        String webpKey = FileUtil.mainName(key) + ".webp";
+        String filePrefix = getFilePrefix(key);
+        String originalSuffix = FileUtil.getSuffix(key);
+        String thumbnailSuffix = StrUtil.blankToDefault(originalSuffix, "png");
+        String webpKey = filePrefix + ".webp";
         PicOperations.Rule compressRule = new PicOperations.Rule();
 
         // 设置处理规则：利用数据万象的基础图片处理接口（imageMogr2），将图片目标格式转换为 webp
@@ -130,7 +135,7 @@ public class CosManager {
             // 业务说明：生成较小尺寸的缩略图能够大幅提升列表页等多图场景的前端加载速度，降低客户端内存开销并节省 CDN 流量成本
             PicOperations.Rule thumbnailUrlRule = new PicOperations.Rule();
 
-            String thumbnailKey = FileUtil.mainName(key) + "_thumbnail." + FileUtil.getSuffix(key);
+            String thumbnailKey = filePrefix + "_thumbnail." + thumbnailSuffix;
             // 设置处理规则：利用数据万象的基础图片处理接口（imageMogr2），将图片按最大宽高 256x256 进行等比缩放
             // 缩放规则: /thumbnail/<Width>x<Height>>（如果大于原图宽高，则不处理）
             thumbnailUrlRule.setRule(String.format("imageMogr2/thumbnail/%sx%s>", 256, 256));
@@ -152,6 +157,50 @@ public class CosManager {
 
         // 6. 执行上传并触发云端图片处理，直接返回包含处理结果（如 WebP 压缩状态）的响应对象
         return cosClient.putObject(putObjectRequest);
+    }
+
+    /**
+     * 删除云端对象（文件）
+     * <p>
+     * 业务说明：根据提供的对象键（Key），从 COS 存储桶中永久删除对应的物理文件。
+     * 通常用于用户删除图片记录时，同步清理云端存储以释放空间。
+     *
+     * @param key 待删除文件在云端的唯一对象键（即存储路径与文件名，例如："public/picture/2023-10-25_uuid.jpg"）
+     * @throws CosClientException 当网络异常或无权限执行删除操作时抛出
+     */
+    public void deleteObject(String key) throws CosClientException {
+        cosClient.deleteObject(cosClientConfig.getBucket(), key);
+    }
+
+    /**
+     * 获取对象 key 去掉扩展名后的同目录前缀。
+     * <p>
+     * 业务背景：例如 "public/u/a.png" -> "public/u/a"。
+     * 后续生成的 WebP 压缩图和缩略图都基于这个前缀生成，
+     * 核心目的有两个：
+     * 1. 保证处理产物仍落在原图所在目录下，方便在 COS 控制台按目录统一管理。
+     * 2. 在删除原图时，能通过同一个前缀（如 prefix="public/u/a"）批量匹配并反推删除所有关联的衍生文件。
+     * </p>
+     *
+     * @param key 云端原始对象键（例如："public/u/a.png" 或根目录的 "a.png"）
+     * @return 剔除后缀后的同目录前缀字符串
+     */
+    public String getFilePrefix(String key) {
+        // 1. 定位最后一个路径分隔符，用于切分“所在目录”和“具体文件名”
+        int slashIndex = key.lastIndexOf("/");
+
+        // 2. 提取目录路径部分
+        // 兼容逻辑：如果找不到 "/"（slashIndex < 0），说明文件直接存放在 Bucket 根目录，目录记为空串；
+        // 否则截取包含最后一个 "/" 在内的前缀（例如："public/u/"）
+        String dir = slashIndex >= 0 ? key.substring(0, slashIndex + 1) : "";
+
+        // 3. 提取完整的原始文件名（带后缀）
+        // 兼容逻辑：同上，根目录文件直接取原 key；否则取最后一个 "/" 之后的字符串（例如："a.png"）
+        String filename = slashIndex >= 0 ? key.substring(slashIndex + 1) : key;
+
+        // 4. 拼接并返回最终前缀
+        // FileUtil.mainName 用于剥离扩展名（"a.png" -> "a"），最终拼接回 "public/u/a"
+        return dir + FileUtil.mainName(filename);
     }
 
 

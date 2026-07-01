@@ -11,9 +11,11 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.extern.slf4j.Slf4j;
+import org.example.yunpicturebackend.config.CosClientConfig;
 import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
+import org.example.yunpicturebackend.manager.CosManager;
 import org.example.yunpicturebackend.manager.FileManager;
 import org.example.yunpicturebackend.manager.upload.FilePictureUpload;
 import org.example.yunpicturebackend.manager.upload.PictureUploadTemplate;
@@ -35,6 +37,7 @@ import org.jsoup.Jsoup;
 import org.springframework.beans.BeanUtils;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
 import org.springframework.web.multipart.MultipartFile;
@@ -45,6 +48,7 @@ import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 import java.io.IOException;
+import java.util.LinkedHashSet;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
@@ -80,6 +84,12 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
     @Resource
     private UrlPictureUpload urlPictureUpload;
+
+    @Resource
+    private CosManager cosManager;
+
+    @Resource
+    private CosClientConfig cosClientConfig;
 
     /**
      * 构建 JVM 级本地缓存 (L1 Cache)
@@ -122,13 +132,16 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (pictureUploadRequest != null) {
             pictureId = pictureUploadRequest.getId();
         }
+        // 记录替换前的旧图片数据。只有重新上传替换文件时才会有值；
+        // 后续必须等新图片信息成功落库后，再清理旧的云端物理文件，避免更新失败时误删仍在使用的旧文件。
+        Picture oldPicture = null;
 
         // 3. 更新操作的防御性编程
         if (pictureId != null) {
             // 3.1 查库获取历史记录
             // 【架构演进说明】这里舍弃了之前通过 lambdaQuery().exists() 仅判断数据是否存在的轻量级做法。
             // 原因：Controller 层取消了管理员权限的一刀切拦截后，我们必须获取到该记录的真实拥有者（userId），以便进行后续的越权校验。
-            Picture oldPicture = this.getById(pictureId);
+            oldPicture = this.getById(pictureId);
             ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR, "图片不存在或已被删除");
 
             // 3.3 审核状态重置 (可选业务逻辑，视具体需求而定)
@@ -207,6 +220,12 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片上传失败");
 
         // 9. 将入库成功的实体对象转换为剔除了敏感字段的 VO 对象返回给前端渲染
+        // 重新上传替换图片文件后，数据库记录已经指向新图片，此时再清理旧图片资源。
+        // 这样可以保证“先上传新文件并更新记录，后删除旧文件”的安全顺序，避免新图保存失败时旧图已被删。
+        if (pictureId != null && oldPicture != null) {
+            this.clearPictureFiles(oldPicture);
+        }
+
         return PictureVO.objToVo(picture);
     }
 
@@ -800,5 +819,158 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         return uploadCount;
     }
 
+    /**
+     * 异步清理图片对应的云端物理存储文件
+     * <p>
+     * 业务场景：当图片记录被逻辑/物理删除或更新替换时触发调用。
+     * 核心逻辑：采用“引用计数”的安全机制，先校验该云端文件是否被其他数据库记录复用。
+     * 只有在确认该文件已成为“孤儿文件”时，才真正发起 COS 删除请求。
+     * 注意：业务要求保留原始上传文件，因此这里只清理 WebP 压缩图、缩略图等派生产物；
+     * 不删除 COS 中的原始图片，方便后续下载、追溯或重新处理。
+     * </p>
+     *
+     * @param oldPicture 包含旧主图 URL 和旧缩略图 URL 信息的历史图片实体
+     */
+    @Async
+    @Override
+    public void clearPictureFiles(Picture oldPicture) {
+        if (oldPicture == null) {
+            return;
+        }
+
+        // 1. 安全校验：查询数据库中是否还有其他记录正在使用同一个主图 URL
+        String pictureUrl = oldPicture.getUrl();
+        if (StrUtil.isBlank(pictureUrl)) {
+            return;
+        }
+
+        long count = this.lambdaQuery()
+                .eq(Picture::getUrl, pictureUrl)
+                .count();
+
+        // 2. 防误删拦截：当前记录删除或替换后，如果数据库里仍有记录指向同一个 URL，说明文件还在被复用，不能删除 COS 物理文件
+        if (count > 0) {
+            return;
+        }
+
+        // 3. COS SDK 删除对象时要求传入对象 Key，而不是数据库中保存的完整访问 URL。
+        // 当前数据库中的主图 URL 通常指向 WebP 压缩图；原始上传文件属于需要保留的业务资产。
+        // 因此这里只按同名前缀补充清理 WebP 和缩略图等派生产物，不删除原始图片。
+        for (String objectKey : buildRelatedCosObjectKeys(pictureUrl)) {
+            deleteCosObject(objectKey, "图片关联文件");
+        }
+
+        // 4. 同步清理关联的缩略图文件（进行非空校验，兼容早期可能没有生成缩略图的历史数据）
+        String thumbnailUrl = oldPicture.getThumbnailUrl();
+        if (StrUtil.isNotBlank(thumbnailUrl) && !StrUtil.equals(pictureUrl, thumbnailUrl)) {
+            deleteCosObject(thumbnailUrl, "缩略图");
+        }
+    }
+
+    /**
+     * 根据数据库中保存的主图 URL 推导需要同步清理的 COS 派生产物 Key。
+     * <p>
+     * 上传链路会先保存原图，再通过数据万象生成 WebP 压缩图和缩略图；数据库主图 url
+     * 优先保存的是 WebP 地址。由于业务要求保留原始上传文件，这里只推导并清理：
+     * WebP 压缩图、不同后缀的缩略图，以及历史异常缩略图 key。
+     */
+    private Set<String> buildRelatedCosObjectKeys(String pictureUrl) {
+        Set<String> objectKeys = new LinkedHashSet<>();
+        String mainObjectKey = parseCosObjectKey(pictureUrl);
+        if (StrUtil.isBlank(mainObjectKey)) {
+            return objectKeys;
+        }
+        objectKeys.add(mainObjectKey);
+
+        String filePrefix = cosManager.getFilePrefix(mainObjectKey);
+        objectKeys.add(filePrefix + ".webp");
+
+        String[] suffixes = {"png", "jpg", "jpeg", "webp"};
+        for (String suffix : suffixes) {
+            objectKeys.add(filePrefix + "_thumbnail." + suffix);
+        }
+        // 兼容早期 URL 没有扩展名时生成的异常缩略图 key，例如 xxx_thumbnail.
+        objectKeys.add(filePrefix + "_thumbnail.");
+        return objectKeys;
+    }
+
+    /**
+     * 删除 COS 中的单个对象，并打印关键日志。
+     * <p>
+     * 注意：COS 删除接口接收的是对象 Key，不是完整访问 URL；同时删除不存在的 Key 通常不会抛出业务错误。
+     * 因此这里必须打印转换后的 Key，便于和 COS 控制台中的对象路径逐字核对。
+     * </p>
+     *
+     * @param fileUrl 数据库中保存的完整访问 URL，或历史数据中直接保存的对象 Key
+     * @param label   日志标签，用于区分主图、缩略图等文件类型
+     */
+    private void deleteCosObject(String fileUrl, String label) {
+        // 1. 核心转换：将前端可访问的完整 URL 解析为 COS 底层 API 真正识别的物理对象键（ObjectKey）
+        String objectKey = parseCosObjectKey(fileUrl);
+
+        // 2. 防御性校验：拦截空数据或无效 URL，避免向云端发起无效 HTTP 请求造成资源浪费
+        if (StrUtil.isBlank(objectKey)) {
+            log.warn("跳过删除 COS {}，文件地址为空，fileUrl = {}", label, fileUrl);
+            return;
+        }
+
+        // 3. 异常隔离：云端网络交互属于不可控的外部依赖。
+        // 使用 try-catch 包裹是为了保证即使删除云端文件失败（如网络超时、权限不足），也不会向外抛出异常从而导致主业务（如数据库记录删除）发生事务回滚。
+        try {
+            log.info("开始删除 COS {}，fileUrl = {}，objectKey = {}", label, fileUrl, objectKey);
+
+            // 发起网络调用物理删除文件
+            cosManager.deleteObject(objectKey);
+
+            log.info("删除 COS {} 完成，objectKey = {}", label, objectKey);
+        } catch (Exception e) {
+            // 4. 故障追溯：详细记录失败时的上下文参数和完整异常堆栈，方便后续排查或通过定时任务进行补偿清理
+            log.error("删除 COS {} 失败，fileUrl = {}，objectKey = {}", label, fileUrl, objectKey, e);
+        }
+    }
+
+    /**
+     * 将数据库中保存的图片访问地址转换为 COS 对象 Key。
+     * <p>
+     * 业务背景：图片表中保存的是前端可直接访问的完整 URL，而腾讯云 COS 的 deleteObject(bucket, key)
+     * 只接受对象 Key。这里统一剥离配置的 host 和多余的斜杠，避免把完整 URL 传给 COS SDK 导致删除（或查询）失败。
+     * </p>
+     *
+     * @param fileUrl 数据库中保存的完整访问 URL，或已经是对象 Key 的历史数据
+     * @return COS 对象 Key，例如 "public/user/a.png"（不带前缀斜杠）
+     */
+    private String parseCosObjectKey(String fileUrl) {
+        // 1. 空值兜底：防止传入 null 或空串引发后续的空指针异常
+        if (StrUtil.isBlank(fileUrl)) {
+            return null;
+        }
+
+        String objectKey = fileUrl;
+        String host = cosClientConfig.getHost();
+
+        // 2. 剥离域名部分：
+        // 如果传入的是包含配置 Host 的完整 URL，则安全剔除该前缀。
+        // 注意：StrUtil.removeSuffix 能够兼容 host 配置项末尾是否带有 "/" 的情况，保证截取的准确性
+        if (StrUtil.isNotBlank(host)) {
+            objectKey = StrUtil.removePrefix(objectKey, StrUtil.removeSuffix(host, "/"));
+        }
+
+        // 3. 规范化路径前缀：
+        // 腾讯云 COS 的对象键（Key）规范是不带前导斜杠的（即 "a/b.jpg" 而不是 "/a/b.jpg"）。
+        // 使用 while 循环剥离，防止出现截取域名后残留多个 "///" 的极端情况
+        while (objectKey.startsWith("/")) {
+            objectKey = objectKey.substring(1);
+        }
+
+        // 4. 清理 URL 查询参数：
+        // 如果传入的 URL 带有临时防盗链签名（?q-sign=xxx）或数据万象图片处理参数（?imageMogr2），
+        // 必须将其丢弃，只保留纯净的物理文件路径，否则 COS 无法精准定位文件
+        int queryIndex = objectKey.indexOf("?");
+        if (queryIndex >= 0) {
+            objectKey = objectKey.substring(0, queryIndex);
+        }
+
+        return objectKey;
+    }
 
 }

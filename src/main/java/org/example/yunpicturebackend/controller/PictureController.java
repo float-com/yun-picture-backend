@@ -210,6 +210,9 @@ public class PictureController {
         boolean result = pictureService.removeById(id);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
 
+        // 清理图片资源
+        pictureService.clearPictureFiles(oldPicture);
+
         // 6. 统一格式返回
         return ResultUtils.success(true);
     }

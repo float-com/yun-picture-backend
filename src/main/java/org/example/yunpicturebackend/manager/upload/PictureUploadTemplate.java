@@ -5,6 +5,7 @@ import cn.hutool.core.date.DateUtil;
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.util.NumberUtil;
 import cn.hutool.core.util.RandomUtil;
+import cn.hutool.core.util.StrUtil;
 import com.qcloud.cos.model.PutObjectResult;
 import com.qcloud.cos.model.ciModel.persistence.CIObject;
 import com.qcloud.cos.model.ciModel.persistence.ImageInfo;
@@ -61,10 +62,22 @@ public abstract class PictureUploadTemplate {
         // 2. 构造文件在云端的唯一对象键（Key）
         // 策略：当天日期作为目录前缀 + 16位随机字母数字 + 原文件后缀名
         // 目的：防止不同用户上传同名文件导致原文件被覆盖；按天做前缀方便在控制台管理和排查
+
+        // 2.1 生成 16 位随机字符串，作为防文件覆盖的核心唯一标识
         String uuid = RandomUtil.randomString(16);
+        // 2.2 解析输入源的原始文件名，并尝试提取扩展名（后缀）
         String originFilename = getOriginFilename(inputSource);
-        String uploadFilename = String.format("%s_%s.%s", DateUtil.formatDate(new Date()), uuid,
-                FileUtil.getSuffix(originFilename));
+        String originSuffix = FileUtil.getSuffix(originFilename);
+
+        // 2.3 动态拼接云端存储的文件名，并进行“无后缀名”的兼容兜底
+        // 业务考量：通常上传的文件都有后缀（如 .png），但某些特殊来源（如网络无后缀图片流、剪贴板数据）可能获取不到后缀。
+        // 使用三元运算符进行安全拼接，避免生成类似 "20231026_uuid." 这种末尾带异常点号的畸形文件名
+        String uploadFilename = StrUtil.isBlank(originSuffix)
+                ? String.format("%s_%s", DateUtil.formatDate(new Date()), uuid)
+                : String.format("%s_%s.%s", DateUtil.formatDate(new Date()), uuid, originSuffix);
+
+        // 2.4 组装最终在 COS 云端存储的绝对路径（包含业务隔离前缀）
+        // 例如："/public/picture/20231026_uuid.jpg" 或无后缀的 "/public/picture/20231026_uuid"
         String uploadPath = String.format("/%s/%s", uploadPathPrefix, uploadFilename);
 
         File file = null;
@@ -107,7 +120,7 @@ public abstract class PictureUploadTemplate {
 
                 // 5. 封装包含压缩图和缩略图的多维返回结果
                 // 优势：优先返回处理后的轻量级图片信息，大幅降低前端列表页的加载延迟和 CDN 流量消耗
-                return buildResult(originFilename, compressedCiObject, thumbnailCiObject);
+                return buildResult(originFilename, uploadPath, compressedCiObject, thumbnailCiObject);
             }
 
             // 5. 兜底策略：如果没有触发任何图片处理规则（或者未配置规则），则直接提取并组装原图的返回结果
@@ -160,11 +173,12 @@ public abstract class PictureUploadTemplate {
      * 此方法专门用于解析这些处理后的对象节点（压缩主图和缩略图），并将其元数据转化为系统标准的结果集返回给前端。
      *
      * @param originFilename     客户端上传时的原始文件名
+     * @param uploadPath         原图在云端的物理存储路径（对象键 Key），用于保留未压缩原图的访问记录
      * @param compressedCiObject 数据万象处理生成的主图对象（通常为 WebP 格式的压缩图）
      * @param thumbnailCiObject  数据万象处理生成的缩略图对象
-     * @return UploadPictureResult 统一的图片上传结果实体（包含压缩主图的宽、高、大小，以及主图和缩略图的访问 URL）
+     * @return UploadPictureResult 统一的图片上传结果实体（包含压缩主图的宽、高、大小，以及主图、原图和缩略图的访问 URL）
      */
-    private UploadPictureResult buildResult(String originFilename, CIObject compressedCiObject, CIObject thumbnailCiObject) {
+    private UploadPictureResult buildResult(String originFilename, String uploadPath, CIObject compressedCiObject, CIObject thumbnailCiObject) {
         UploadPictureResult uploadPictureResult = new UploadPictureResult();
 
         // 1. 提取主图（压缩处理后）的尺寸信息
@@ -187,7 +201,12 @@ public abstract class PictureUploadTemplate {
         // 5. 拼接主图（压缩图）的外部访问链接，使用 COS 配置的 Host 和处理后生成的新对象键（Key）
         uploadPictureResult.setUrl(cosClientConfig.getHost() + "/" + compressedCiObject.getKey());
 
-        // 6. 拼接缩略图的外部访问链接，供前端在瀑布流、列表页等场景下快速加载
+        // 6. 保留并拼接原始图片的外部访问链接
+        // 业务原因：由于上面的主 url 字段现在指向的是经过 WebP 压缩优化后的图片，
+        // 为了兼顾用户日后需要下载或查看“未经任何画质损失的原图”的特殊业务需求，这里将最初的上传路径单独留存
+        uploadPictureResult.setOriginUrl(cosClientConfig.getHost() + "/" + uploadPath);
+
+        // 7. 拼接缩略图的外部访问链接，供前端在瀑布流、列表页等场景下快速加载
         uploadPictureResult.setThumbnailUrl(cosClientConfig.getHost() + "/" + thumbnailCiObject.getKey());
 
         return uploadPictureResult;
@@ -226,6 +245,7 @@ public abstract class PictureUploadTemplate {
 
         // 5. 拼接原图的绝对访问 URL 链接（例如：https://your-bucket.cos.ap-guangzhou...）
         uploadPictureResult.setUrl(cosClientConfig.getHost() + "/" + uploadPath);
+        uploadPictureResult.setOriginUrl(cosClientConfig.getHost() + "/" + uploadPath);
 
         return uploadPictureResult;
     }

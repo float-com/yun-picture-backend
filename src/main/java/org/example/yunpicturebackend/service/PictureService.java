@@ -140,4 +140,15 @@ public interface PictureService extends IService<Picture> {
             User loginUser
     );
 
+    /**
+     * 清理图片对应的云端物理存储文件
+     * <p>
+     * 在图片记录被物理删除或更新替换的业务场景下，根据传入的旧图片记录信息，
+     * 清理对象存储（如腾讯云 COS）中残留的缩略图、WebP 压缩图等物理文件，
+     * 避免产生“孤儿文件”白白消耗云端存储空间与计费成本。
+     * </p>
+     *
+     * @param oldPicture 包含旧对象键（Key）等关联信息的历史图片实体，用于精准定位并执行云端清理操作
+     */
+    void clearPictureFiles(Picture oldPicture);
 }

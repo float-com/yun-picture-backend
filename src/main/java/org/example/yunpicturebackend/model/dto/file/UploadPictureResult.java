@@ -18,6 +18,15 @@ public class UploadPictureResult {
     private String url;
 
     /**
+     * 原图访问地址 (URL)
+     * <p>
+     * 说明：当前主图 url 会优先指向 COS 数据万象生成的 WebP 压缩图，
+     * 但 COS 中仍会保留本次上传的原始文件。这里单独记录原图地址，
+     * 用于后续下载、追溯或重新处理；删除图片记录时默认保留该原始文件。
+     */
+    private String originUrl;
+
+    /**
      * 图片缩略图访问地址 (URL)
      * <p>
      * 说明：通常是上传原图时，通过对象存储图片处理服务（如腾讯云 COS 数据万象）同步或异步处理生成的较小尺寸缩略图访问链接。
