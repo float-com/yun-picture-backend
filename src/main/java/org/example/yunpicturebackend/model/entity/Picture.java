@@ -29,6 +29,11 @@ public class Picture {
     private String url;
 
     /**
+     * 图片缩略图访问 URL（通常存储上传原图时通过 COS 数据万象等服务同步处理生成的缩略图访问链接）
+     */
+    private String thumbnailUrl;
+
+    /**
      * 图片名称（用于前端界面展示和基础搜索）
      */
     private String name;

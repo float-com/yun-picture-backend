@@ -17,6 +17,13 @@ public class UploadPictureResult {
      */
     private String url;
 
+    /**
+     * 图片缩略图访问地址 (URL)
+     * <p>
+     * 说明：通常是上传原图时，通过对象存储图片处理服务（如腾讯云 COS 数据万象）同步或异步处理生成的较小尺寸缩略图访问链接。
+     */
+    private String thumbnailUrl;
+
     /** * 图片名称
      * <p>
      * 说明：通常为提取的原始文件名（包含扩展名），用于在前端图库列表中展示。

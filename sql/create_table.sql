@@ -94,3 +94,10 @@ ALTER TABLE picture
 -- 补充索引：加速审核业务查询
 -- ==========================================
 CREATE INDEX idx_reviewStatus ON picture (reviewStatus) COMMENT '普通索引：加速后台管理系统筛选待审核或特定状态的图片列表，大幅提升审核工作台的加载性能';
+
+
+-- ==========================================
+-- 新增缩略图字段，用于存储通过 COS 数据万象处理后生成的缩略图地址
+ALTER TABLE picture
+    ADD COLUMN thumbnailUrl VARCHAR(512) NULL COMMENT '缩略图 URL';
+-- ==========================================

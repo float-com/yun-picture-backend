@@ -168,6 +168,8 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 6. 数据搬运与装配：将上传成功后的 DTO 结果转换为数据库底层能识别的 Entity 实体
         Picture picture = new Picture();
         picture.setUrl(uploadPictureResult.getUrl());
+        //补充缩略图字段
+        picture.setThumbnailUrl(uploadPictureResult.getThumbnailUrl());
 
         // 6.5 解析与挂载图片名称
         // 【业务场景】默认情况下，系统会自动从云端返回的元数据或原始物理文件中提取名称作为缺省值。
