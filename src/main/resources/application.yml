@@ -2,16 +2,24 @@
 server:
   port: 8123  # 服务端口号
   servlet:
-    context-path: /api  # 应用的上下文路径，所有请求会加上/api 前缀
+    context-path: /api  # 应用的上下文路径，所有请求会加上 /api 前缀
+    session:
+      cookie:
+        max-age: 2592000  # 客户端 Cookie 过期时间，单位为秒 (2592000 秒 = 30 天)
 
 # Spring 配置
 spring:
   application:
     name: yun-picture-backend  # 应用名称
-  # 开放更大的文件上传体积
+
   servlet:
     multipart:
-      max-file-size: 10MB
+      max-file-size: 10MB  # 开放更大的文件上传体积限制 (单文件最大 10MB)
+
+  # Spring Session 配置 (基于 Redis 实现分布式会话共享)
+  session:
+    store-type: redis  # 指定 Session 存储类型为 Redis，解决多节点部署时的 Session 共享问题
+    timeout: 2592000   # Redis 中 Session 数据的过期时间，单位为秒 (2592000 秒 = 30 天)
 
   # 数据库配置
   datasource:

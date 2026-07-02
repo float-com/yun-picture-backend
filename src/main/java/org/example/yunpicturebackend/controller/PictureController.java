@@ -61,15 +61,12 @@ public class PictureController {
     private StringRedisTemplate stringRedisTemplate;
 
     /**
-     * 构建 JVM 级本地缓存 (L1 Cache)
-     * <p>
-     * 【架构演进：为什么在 Redis 之外还需要本地缓存？】
-     * 在极高并发（如秒杀、C端首页高频拉取）场景下，纵然有 Redis (L2 Cache) 加持，网络 I/O 的开销
-     * 以及 Redis 集群面对“极端热点 Key”时的性能瓶颈依然存在。
-     * 引入基于 Caffeine（当前 Java 生态下性能天花板的本地缓存框架）的 JVM 缓存，
-     * 能够将部分高频读请求直接拦截在应用服务器（Tomcat）内部，实现“纳秒级”的极致响应，彻底解放 Redis 与 MySQL。
-     * </p>
+     * @deprecated Controller 内部的本地缓存仅服务于早期缓存演示接口，当前生产查询链路已下沉到 Service。
+     * 继续在 Controller 中维护缓存会造成职责混杂，也无法被写操作统一失效。
+     * 新代码请使用 {@link PictureService#listPictureVOByPageWithCache(PictureQueryRequest, HttpServletRequest)}，
+     * 其内部已经统一管理 Caffeine 本地缓存、Redis 二级缓存和写后缓存失效。
      */
+    @Deprecated
     private final Cache<String, String> LOCAL_CACHE = Caffeine.newBuilder()
             // 【性能调优：内存预分配】
             // 设置底层哈希表的初始容量。在系统刚启动或突发流量涌入时，能有效避免
@@ -210,6 +207,9 @@ public class PictureController {
         boolean result = pictureService.removeById(id);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
 
+        // 图片记录删除后，列表分页缓存中的旧数据会失效；主动清理缓存，避免前端短暂继续显示已删除图片
+        pictureService.clearPictureVOPageCache();
+
         // 清理图片资源
         pictureService.clearPictureFiles(oldPicture);
 
@@ -264,6 +264,9 @@ public class PictureController {
         // 6. 覆盖更新并响应
         boolean result = pictureService.updateById(picture);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+
+        // 管理员更新会影响列表展示字段或审核可见性，写入成功后清理图片列表缓存
+        pictureService.clearPictureVOPageCache();
         return ResultUtils.success(true);
     }
 
@@ -362,8 +365,10 @@ public class PictureController {
     }
 
     /**
-     * 分页获取图片视图列表接口（供 C 端普通用户使用）[Redis缓存架构]
-     * 此接口仅用于演示Redis缓存优化，不投入项目使用。
+     * @deprecated Redis 单级缓存演示接口，当前前端未使用，也不再作为生产查询链路维护。
+     * 单独维护 Redis 缓存容易遗漏写后失效，导致上传后不显示、删除后短暂残留等一致性问题。
+     * 请改用 {@link #listPictureVOByPageWithCache(PictureQueryRequest, HttpServletRequest)}，
+     * 由 Service 层统一处理多级缓存读取和写操作后的缓存清理。
      * <p>
      * 【架构考量：为什么引入 Redis 缓存？】
      * C 端首页的图片展示是典型的高频读、低频写的“热点接口”。如果任由海量并发请求直接打穿到 MySQL，
@@ -375,6 +380,7 @@ public class PictureController {
      * @param request             用于提取当前登录态
      * @return 包含脱敏数据分页对象 (Page<PictureVO>) 的统一响应体
      */
+    @Deprecated
     @PostMapping("/list/page/vo/Redis")
     public BaseResponse<Page<PictureVO>> listPictureVOByPageWithRedis(
             @RequestBody PictureQueryRequest pictureQueryRequest,
@@ -432,8 +438,10 @@ public class PictureController {
     }
 
     /**
-     * 分页获取图片视图列表接口（供 C 端普通用户使用）[纯本地缓存架构版]
-     * 此接口仅用于演示本地缓存优化，不投入项目使用。
+     * @deprecated Caffeine 单级本地缓存演示接口，当前前端未使用，也不再作为生产查询链路维护。
+     * 单独依赖 JVM 本地缓存无法跨节点共享，并且容易绕过统一的写后失效逻辑。
+     * 请改用 {@link #listPictureVOByPageWithCache(PictureQueryRequest, HttpServletRequest)}，
+     * 由 Service 层统一处理 Caffeine + Redis 多级缓存。
      * <p>
      * 【架构演进：为什么从 Redis 降级/切换为本地缓存？】
      * 在极端的“读多写少”且“数据一致性要求不高”的场景下（例如 C 端默认首页的推荐流），
@@ -446,6 +454,7 @@ public class PictureController {
      * @param request             用于提取当前登录态
      * @return 包含脱敏数据分页对象 (Page<PictureVO>) 的统一响应体
      */
+    @Deprecated
     @PostMapping("/list/page/vo/LocalCache")
     public BaseResponse<Page<PictureVO>> listPictureVOByPageWithLocalCache(
             @RequestBody PictureQueryRequest pictureQueryRequest,
@@ -503,8 +512,9 @@ public class PictureController {
 
 
     /**
-     * 分页获取图片视图列表接口（供 C 端普通用户使用）[多级缓存架构版]
-     * 此接口已废弃，其核心业务逻辑已重构并下沉至 Service 层统一管理。
+     * @deprecated Controller 内旧版多级缓存演示方法，路由已关闭，当前不投入项目使用。
+     * 该方法仍保留在代码中用于对照缓存演进过程，但正式接口已经迁移到
+     * {@link #listPictureVOByPageWithCache(PictureQueryRequest, HttpServletRequest)}，并由 Service 层统一管理缓存。
      * <p>
      * 【架构演进：为什么引入 多级缓存 (L1 Caffeine + L2 Redis)？】
      * 1. 极致性能 (L1)：C端首页的流量极其庞大。将高频访问的首页数据缓存在 JVM 内存 (Caffeine) 中，
@@ -518,6 +528,7 @@ public class PictureController {
      * @param request             用于提取当前登录态
      * @return 包含脱敏数据分页对象 (Page<PictureVO>) 的统一响应体
      */
+    @Deprecated
     //@PostMapping("/list/page/vo/cache")
     public BaseResponse<Page<PictureVO>> listPictureVOByPageWithCatch(
             @RequestBody PictureQueryRequest pictureQueryRequest,
@@ -662,6 +673,9 @@ public class PictureController {
         // 6. 落库保存
         boolean result = pictureService.updateById(picture);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+
+        // 普通编辑会影响列表展示内容，写入成功后清理图片列表缓存
+        pictureService.clearPictureVOPageCache();
         return ResultUtils.success(true);
     }
 

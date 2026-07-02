@@ -69,9 +69,15 @@ import java.util.stream.Collectors;
 public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         implements PictureService{
 
-    /*已弃用*/
-//    @Resource
-//    private FileManager fileManager;
+    /**
+     * @deprecated 旧版本地文件上传管理器已废弃，仅保留作历史实现对照。
+     * 该实现将文件上传、校验、解析和 COS 存储逻辑集中在一个类中，扩展 MultipartFile 与 URL 上传时容易产生重复代码。
+     * 新上传链路请使用基于模板方法的 {@link PictureUploadTemplate}，并根据输入源选择
+     * {@link FilePictureUpload} 或 {@link UrlPictureUpload}。
+     */
+    @Deprecated
+    @Resource
+    private FileManager fileManager;
 
     @Resource
     private UserService userService;
@@ -90,6 +96,14 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
     @Resource
     private CosClientConfig cosClientConfig;
+
+    /**
+     * 图片分页 VO 缓存 Key 前缀。
+     * <p>
+     * 所有 /list/page/vo/cache 查询生成的 Redis Key 都以该前缀开头，写操作成功后按此前缀统一清理，
+     * 避免上传、删除、编辑、审核后前端继续命中旧列表缓存。
+     */
+    private static final String PICTURE_VO_PAGE_CACHE_KEY_PREFIX = "yunpicture:listPictureVOByPage:";
 
     /**
      * 构建 JVM 级本地缓存 (L1 Cache)
@@ -218,6 +232,9 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 机制：底层会自动判断 picture 对象的 id 是否为空，若为空执行 insert，非空则执行 updateById
         boolean result = this.saveOrUpdate(picture);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片上传失败");
+
+        // 图片列表接口使用了多级缓存；新增或替换图片成功后，必须主动清理列表缓存，避免前端继续看到旧分页结果。
+        this.clearPictureVOPageCache();
 
         // 9. 将入库成功的实体对象转换为剔除了敏感字段的 VO 对象返回给前端渲染
         // 重新上传替换图片文件后，数据库记录已经指向新图片，此时再清理旧图片资源。
@@ -479,7 +496,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 将冗长的 JSON 字符串转换为字节数组，并使用 MD5 算法生成 32 位的十六进制哈希值，以此压缩 Key 的长度
         String hashKey = DigestUtils.md5DigestAsHex(queryCondition.getBytes());
         // 拼接业务模块前缀与生成的哈希值，返回最终用于 L1 本地缓存和 L2 Redis 缓存的共享 Key
-        return "yunpicture:listPictureVOByPage:" + hashKey;
+        return PICTURE_VO_PAGE_CACHE_KEY_PREFIX + hashKey;
     }
 
     /**
@@ -545,6 +562,34 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         int cacheExpireTime = 300 + RandomUtil.randomInt(0, 300);
         // 将数据写入 L2 缓存 (Redis)，并设置带有随机抖动的过期时间
         valueOps.set(cacheKey, cacheValue, cacheExpireTime, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 清理图片分页 VO 列表缓存。
+     * <p>
+     * 缓存一致性策略：图片列表属于读多写少场景，查询时使用 Caffeine + Redis 提升性能；
+     * 但只要图片数据发生写入变化（上传、删除、编辑、审核等），旧分页结果就可能包含过期数据。
+     * 因此写操作成功后统一清空本地缓存，并按业务前缀删除 Redis 中的列表缓存。
+     * </p>
+     * <p>
+     * 注意：缓存清理失败不应影响主业务写操作结果，所以 Redis 清理异常只记录日志，不向外抛出。
+     * </p>
+     */
+    @Override
+    public void clearPictureVOPageCache() {
+        LOCAL_CACHE.invalidateAll();
+
+        try {
+            Set<String> cacheKeys = stringRedisTemplate.keys(PICTURE_VO_PAGE_CACHE_KEY_PREFIX + "*");
+            if (CollUtil.isEmpty(cacheKeys)) {
+                log.info("图片分页 VO 缓存清理完成，本地缓存已清空，Redis 缓存数量 = 0");
+                return;
+            }
+            Long deleteCount = stringRedisTemplate.delete(cacheKeys);
+            log.info("图片分页 VO 缓存清理完成，本地缓存已清空，Redis 缓存删除数量 = {}", deleteCount);
+        } catch (Exception e) {
+            log.error("图片分页 VO Redis 缓存清理失败，本地缓存已清空", e);
+        }
     }
     //=================================================================================================
 
@@ -661,6 +706,9 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 执行更新并校验结果
         boolean result = this.updateById(updatePicture);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片审核状态更新失败，请重试");
+
+        // 审核状态会影响 C 端列表是否展示该图片，审核成功后必须清理列表缓存。
+        this.clearPictureVOPageCache();
     }
 
 

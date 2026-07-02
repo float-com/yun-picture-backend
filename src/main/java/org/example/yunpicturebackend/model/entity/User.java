@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableLogic;
 import com.baomidou.mybatisplus.annotation.TableName;
+import java.io.Serializable;
 import java.util.Date;
 import lombok.Data;
 
@@ -13,7 +14,10 @@ import lombok.Data;
  */
 @TableName(value ="user")
 @Data
-public class User {
+public class User implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
     /**
      * 主键 ID（使用 BIGINT 便于后期扩展为雪花算法等分布式 ID）
      * [补充说明] 此处舍弃了数据库自增 ID（IdType.AUTO），改为使用 IdType.ASSIGN_ID。

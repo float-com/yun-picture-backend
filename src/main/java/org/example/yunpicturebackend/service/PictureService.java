@@ -141,6 +141,15 @@ public interface PictureService extends IService<Picture> {
     );
 
     /**
+     * 清理图片分页 VO 列表缓存
+     * <p>
+     * 凡是上传、删除、编辑、审核等会影响图片列表结果的写操作成功后，都应调用该方法，
+     * 统一让 Caffeine 本地缓存和 Redis 二级缓存失效，避免前端列表短暂命中旧数据。
+     * </p>
+     */
+    void clearPictureVOPageCache();
+
+    /**
      * 清理图片对应的云端物理存储文件
      * <p>
      * 在图片记录被物理删除或更新替换的业务场景下，根据传入的旧图片记录信息，
