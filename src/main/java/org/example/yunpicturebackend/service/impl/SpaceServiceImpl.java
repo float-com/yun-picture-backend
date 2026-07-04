@@ -6,8 +6,10 @@ import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
+import org.example.yunpicturebackend.model.dto.space.SpaceAddRequest;
 import org.example.yunpicturebackend.model.dto.space.SpaceQueryRequest;
 import org.example.yunpicturebackend.model.entity.Space;
 import org.example.yunpicturebackend.model.entity.User;
@@ -17,13 +19,17 @@ import org.example.yunpicturebackend.model.vo.UserVO;
 import org.example.yunpicturebackend.service.SpaceService;
 import org.example.yunpicturebackend.mapper.SpaceMapper;
 import org.example.yunpicturebackend.service.UserService;
+import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -37,6 +43,86 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
 
     @Resource
     private  UserService userService;
+
+    @Resource
+    private TransactionTemplate transactionTemplate;
+
+    /**
+     * 用户本地锁池 (ConcurrentHashMap)
+     * 架构考量：替代 String.intern() 进行细粒度加锁，避免无限制污染 JVM 字符串常量池。
+     * 注意：此处刻意不提供 remove 逻辑，以防止高并发下多个线程竞争同一把锁时，由于锁对象被提前释放而导致的并发击穿问题。
+     */
+    private final Map<Long, Object> lockMap = new ConcurrentHashMap<>();
+
+    /**
+     * 创建图库空间 (支持细粒度并发防重与编程式事务)
+     * <p>
+     * 业务场景：用户在前端点击“开通私有空间”时调用。系统强制限制每个用户最多只能拥有一个私有图库空间。
+     * 架构考量：
+     * 1. 锁粒度优化：采用基于 userId 的局部互斥锁（ConcurrentHashMap），相比方法级的锁大幅提升了系统的并发吞吐量。
+     * 2. 事务与锁的执行顺序：必须保证【锁包裹事务】（先 synchronized 加锁，再开启 transactionTemplate 事务）。如果反过来，会导致事务尚未提交，锁就被释放，从而引发脏读超卖问题。
+     *
+     * @param spaceAddRequest 包含空间名称、级别等初始参数的请求体 DTO
+     * @param loginUser       当前已认证的登录用户对象
+     * @return 新创建的图库空间主键 ID
+     */
+    @Override
+    public long addSpace(SpaceAddRequest spaceAddRequest, User loginUser) {
+        // 1. DTO 转换为 Entity (隔离外部参数与底层数据模型)
+        Space space = new Space();
+        BeanUtils.copyProperties(spaceAddRequest, space);
+
+        // 2. 初始化默认值：提升接口的业务包容性
+        if (StrUtil.isBlank(spaceAddRequest.getSpaceName())) {
+            space.setSpaceName("默认空间");
+        }
+        if (spaceAddRequest.getSpaceLevel() == null) {
+            space.setSpaceLevel(SpaceLevelEnum.COMMON.getValue());
+        }
+
+        // 3. 动态装配与校验
+        // 根据空间级别自动填充对应的容量和数量配额
+        this.fillSpaceBySpaceLevel(space);
+        // 校验基础字段合法性 (true 表示当前为新增操作)
+        this.validSpace(space, true);
+
+        // 4. 绑定属主关系
+        Long userId = loginUser.getId();
+        space.setUserId(userId);
+
+        // 5. 核心越权防御
+        // 业务规则：普通用户只能创建“普通版”空间；若要直接开通高级别空间，操作者必须具备管理员角色
+        if (SpaceLevelEnum.COMMON.getValue() != spaceAddRequest.getSpaceLevel() && !userService.isAdmin(loginUser)) {
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "无权限创建指定级别的私有空间");
+        }
+
+        // 6. 细粒度并发锁控制 (解决连点器导致的重复创建问题)
+        // 只有同一个 userId 才会获取到同一个 Object 锁对象，不同用户互不阻塞
+        Object lock = lockMap.computeIfAbsent(userId, key -> new Object());
+
+        synchronized (lock) {
+            // 7. 编程式事务执行：确保查询校验与插入操作的原子性
+            Long newSpaceId = transactionTemplate.execute(status -> {
+
+                // 7.1. 唯一性校验：查询该用户是否已经拥有图库空间
+                boolean exists = this.lambdaQuery()
+                        .eq(Space::getUserId, userId)
+                        .exists();
+
+                ThrowUtils.throwIf(exists, ErrorCode.OPERATION_ERROR, "每个用户仅能拥有一个私有空间");
+
+                // 7.2. 物理落库
+                boolean result = this.save(space);
+                ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "保存空间到数据库失败");
+
+                // 7.3. 返回底层自增/雪花算法生成的新主键 ID
+                return space.getId();
+            });
+
+            // 8. 拆箱与安全返回 (规避包装类引发的 NPE)
+            return Optional.ofNullable(newSpaceId).orElse(-1L);
+        }
+    }
 
 
     /**

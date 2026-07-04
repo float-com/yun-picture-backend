@@ -10,6 +10,7 @@ import org.example.yunpicturebackend.constant.UserConstant;
 import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
+import org.example.yunpicturebackend.model.dto.space.SpaceAddRequest;
 import org.example.yunpicturebackend.model.dto.space.SpaceEditRequest;
 import org.example.yunpicturebackend.model.dto.space.SpaceQueryRequest;
 import org.example.yunpicturebackend.model.dto.space.SpaceUpdateRequest;
@@ -44,6 +45,30 @@ public class SpaceController {
     @Resource
     private SpaceService spaceService;
 
+    /**
+     * 创建图库空间接口
+     * <p>
+     * 业务场景：用户在前端主动开通个人私有空间，或后台管理员手动为特定用户分配新空间时调用。
+     * 架构考量：Controller 层保持极简（网关职责），仅负责 HTTP 参数的接收、基础防空拦截以及会话（Session）数据的提取，复杂的锁逻辑、配额分配及事务落库全权下沉至 Service 层处理。
+     *
+     * @param spaceAddRequest 包含空间名称、空间级别等初始参数的请求封装对象 (DTO)
+     * @param request         用于提取当前用户的登录态（会话上下文）
+     * @return 包装在统一响应体 BaseResponse 中的长整型，标识新创建成功的空间主键 ID
+     */
+    @PostMapping("/add")
+    public BaseResponse<Long> addSpace(@RequestBody SpaceAddRequest spaceAddRequest, HttpServletRequest request) {
+        // 1. 基础防空：拦截毫无意义的空请求体，防止下层发生空指针异常 (NPE)
+        ThrowUtils.throwIf(spaceAddRequest == null, ErrorCode.PARAMS_ERROR);
+
+        // 2. 提取上下文：获取当前发起请求的用户实体，用作后续私有空间绑定属主 (userId) 的核心凭证
+        User loginUser = userService.getLoginUser(request);
+
+        // 3. 核心业务调度：下沉至 Service 层执行默认值初始化、并发防重（加锁）、编程式事务控制与落库
+        long newId = spaceService.addSpace(spaceAddRequest, loginUser);
+
+        // 4. 标准化响应：将底层生成的新主键 ID 包装进全局统一的成功响应体中返回给前端
+        return ResultUtils.success(newId);
+    }
 
     /**
      * 删除图库空间接口

@@ -7,21 +7,25 @@ import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import lombok.extern.slf4j.Slf4j;
+import org.example.yunpicturebackend.model.dto.space.SpaceAddRequest;
 import org.example.yunpicturebackend.model.dto.user.UserLoginRequest;
 import org.example.yunpicturebackend.model.dto.user.UserQueryRequest;
 import org.example.yunpicturebackend.model.dto.user.UserRegisterRequest;
 import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.model.entity.User;
+import org.example.yunpicturebackend.model.enums.SpaceLevelEnum;
 import org.example.yunpicturebackend.model.enums.UserRoleEnum;
 import org.example.yunpicturebackend.model.vo.LoginUserVO;
 import org.example.yunpicturebackend.model.vo.UserVO;
+import org.example.yunpicturebackend.service.SpaceService;
 import org.example.yunpicturebackend.service.UserService;
 import org.example.yunpicturebackend.mapper.UserMapper;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
 
+import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
 
 import java.util.ArrayList;
@@ -46,6 +50,9 @@ import static org.example.yunpicturebackend.constant.UserConstant.USER_LOGIN_STA
  */
 public class UserServiceImpl extends ServiceImpl<UserMapper, User>
         implements UserService {
+
+    @Resource
+    private SpaceService spaceService;
 
     @Override
     public long userRegister(UserRegisterRequest userRegisterRequest) {
@@ -120,6 +127,21 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User>
         boolean saveResult = this.save(user);
         if (!saveResult) {
             throw new BusinessException(ErrorCode.SYSTEM_ERROR, "注册失败，数据库错误");
+        }
+
+        // ==================== 6. 注册后自动开通默认空间（容错增强） ====================
+        /*
+         * 业务场景：用户注册成功后，系统尽量自动为其创建一个“普通版默认空间”，让新用户进入系统后可以直接上传和管理图片。
+         * 兜底策略：空间创建属于注册后的配套初始化能力，不应反向影响“账号已成功创建”这个主流程。
+         * 因此这里采用 try-catch 包裹：如果数据库短暂抖动、并发防重命中或空间模块异常，只记录错误日志，用户后续仍可通过 /space/add 手动创建空间。
+         */
+        try {
+            SpaceAddRequest spaceAddRequest = new SpaceAddRequest();
+            spaceAddRequest.setSpaceName("默认空间");
+            spaceAddRequest.setSpaceLevel(SpaceLevelEnum.COMMON.getValue());
+            spaceService.addSpace(spaceAddRequest, user);
+        } catch (Exception e) {
+            log.error("create default space failed after user register, userId = {}", user.getId(), e);
         }
 
         // 插入成功后，MyBatis-Plus 会自动将数据库生成的自增 ID 赋值回 user 对象的 id 属性中。

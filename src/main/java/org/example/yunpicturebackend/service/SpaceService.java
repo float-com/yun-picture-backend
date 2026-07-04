@@ -3,8 +3,10 @@ package org.example.yunpicturebackend.service;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.IService;
+import org.example.yunpicturebackend.model.dto.space.SpaceAddRequest;
 import org.example.yunpicturebackend.model.dto.space.SpaceQueryRequest;
 import org.example.yunpicturebackend.model.entity.Space;
+import org.example.yunpicturebackend.model.entity.User;
 import org.example.yunpicturebackend.model.vo.SpaceVO;
 
 import javax.servlet.http.HttpServletRequest;
@@ -15,6 +17,21 @@ import javax.servlet.http.HttpServletRequest;
  * @createDate 2026-07-02 11:30:34
  */
 public interface SpaceService extends IService<Space> {
+
+    /**
+     * 创建图库空间
+     * <p>
+     * 业务场景：用户在前端主动开通个人私有空间，或后台管理员手动为特定用户分配新空间时调用。
+     * 核心逻辑：
+     * 1. 默认值初始化：自动处理前端未传递的非必填字段，赋予默认空间名称及基础级别（普通版）。
+     * 2. 动态配额装配：根据空间级别（spaceLevel），自动从系统配置中提取并绑定对应的容量上限与数量上限。
+     * 3. 并发与事务安全：底层结合基于 userId 的细粒度互斥锁与编程式事务，确保高并发场景下每个用户仅能成功创建一个私有空间，彻底杜绝脏数据。
+     *
+     * @param spaceAddRequest 包含空间名称、空间级别等初始参数的请求封装对象 (DTO)
+     * @param loginUser       当前已认证的登录用户对象（用于提取 userId 绑定空间的唯一归属权，并辅助判断是否具有跨级创建权限）
+     * @return long           新创建图库空间的底层主键 ID
+     */
+    long addSpace(SpaceAddRequest spaceAddRequest, User loginUser);
 
     /**
      * 构建空间查询的 MyBatis-Plus 包装类 (QueryWrapper)
