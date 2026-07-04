@@ -101,3 +101,52 @@ CREATE INDEX idx_reviewStatus ON picture (reviewStatus) COMMENT '普通索引：
 ALTER TABLE picture
     ADD COLUMN thumbnailUrl VARCHAR(512) NULL COMMENT '缩略图 URL';
 -- ==========================================
+
+
+
+-- ==========================================
+-- 表名称：space
+-- 表描述：图库空间表（用于实现私有或共享的图片独立存储空间，支持基于级别的容量与数量限额管控）
+-- ==========================================
+CREATE TABLE IF NOT EXISTS space
+(
+    -- 基础核心字段
+    id           BIGINT AUTO_INCREMENT                  COMMENT '主键 ID（使用 BIGINT 便于后期扩展为雪花算法等分布式 ID）' PRIMARY KEY,
+    spaceName    VARCHAR(128)                           NULL COMMENT '空间名称（用于前端空间列表展示和基础搜索）',
+    spaceLevel   INT          DEFAULT 0                 NULL COMMENT '空间级别（枚举值：0-普通版; 1-专业版; 2-旗舰版。使用整型代替字符串可节约存储空间并提升查询效率）',
+
+    -- 空间配额控制字段 (Quota Fields)
+    maxSize      BIGINT       DEFAULT 0                 NULL COMMENT '空间容量配额（单位：字节/Byte，限制该空间下图片的总大小。独立字段便于管理员单独调整特定空间的限额，解耦代码硬编码）',
+    maxCount     BIGINT       DEFAULT 0                 NULL COMMENT '空间数量配额（限制该空间下允许上传的图片最大总数，独立字段控制利于业务灵活扩展与查询）',
+
+    -- 空间状态统计字段 (Statistics Fields)
+    totalSize    BIGINT       DEFAULT 0                 NULL COMMENT '当前已用容量（单位：字节/Byte，实时记录当前空间下所有图片的总大小，用于快速校验上传是否超限）',
+    totalCount   BIGINT       DEFAULT 0                 NULL COMMENT '当前已有数量（实时记录当前空间下的图片总数，配合 maxCount 进行阈值拦截校验）',
+
+    -- 归属与权限控制字段
+    userId       BIGINT                                 NOT NULL COMMENT '所属用户 ID（关联 user 表主键，标识该空间的拥有者，实现私有空间的权限隔离）',
+
+    -- 审计与生命周期字段 (Audit Fields)
+    createTime   DATETIME     DEFAULT CURRENT_TIMESTAMP NOT NULL COMMENT '记录创建时间（系统插入数据时自动写入）',
+    editTime     DATETIME     DEFAULT CURRENT_TIMESTAMP NOT NULL COMMENT '资料最后手动编辑时间（记录用户主动修改空间信息的时间）',
+    updateTime   DATETIME     DEFAULT CURRENT_TIMESTAMP NOT NULL ON UPDATE CURRENT_TIMESTAMP COMMENT '记录最后更新时间（底层行数据变更时 MySQL 自动触发更新）',
+    isDelete     TINYINT      DEFAULT 0                 NOT NULL COMMENT '逻辑删除标志：0-正常未删除 / 1-已删除（配合 MyBatis-Plus 全局逻辑删除配置使用）',
+
+    -- 索引设计 (Indexes)
+    INDEX idx_userId (userId)                           COMMENT '普通索引：加速查询某位用户拥有的所有空间列表（个人空间管理核心索引）',
+    INDEX idx_spaceName (spaceName)                     COMMENT '普通索引：加速后台管理系统或前端界面按空间名称进行的检索查询',
+    INDEX idx_spaceLevel (spaceLevel)                   COMMENT '普通索引：加速后台筛选特定级别的空间，便于进行等级相关的运营统计与批量操作'
+) COMMENT '图库空间表' COLLATE = utf8mb4_unicode_ci;
+
+
+-- ==========================================
+-- 业务变更：关联图片与存储空间 (实现多租户/私有库隔离)
+-- ==========================================
+ALTER TABLE picture
+    -- 添加空间关联字段
+    ADD COLUMN spaceId BIGINT NULL COMMENT '归属空间 ID（关联 space 表主键，实现图片与特定私有空间的绑定；若为空则表示该图片上传到了公共图库）';
+
+-- ==========================================
+-- 补充索引：加速空间内图片的加载与查询
+-- ==========================================
+CREATE INDEX idx_spaceId ON picture (spaceId) COMMENT '普通索引：加速查询特定私有空间下的所有图片列表，大幅提升空间内瀑布流等业务的加载性能';
