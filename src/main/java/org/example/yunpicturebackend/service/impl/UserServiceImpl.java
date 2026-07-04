@@ -22,6 +22,7 @@ import org.example.yunpicturebackend.service.SpaceService;
 import org.example.yunpicturebackend.service.UserService;
 import org.example.yunpicturebackend.mapper.UserMapper;
 import org.springframework.beans.BeanUtils;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
 
@@ -51,6 +52,16 @@ import static org.example.yunpicturebackend.constant.UserConstant.USER_LOGIN_STA
 public class UserServiceImpl extends ServiceImpl<UserMapper, User>
         implements UserService {
 
+    /**
+     * 图库空间服务 (延迟注入)
+     * <p>
+     * 架构考量：解决 UserService 与 SpaceService 之间的双向循环依赖（Circular Dependency）问题。
+     * 底层机制：在 Spring Boot 2.6+ 默认禁止循环依赖的背景下，标注 @Lazy 会改变默认的急切初始化策略。
+     * 容器在实例化当前类时，不会强行去拉起 SpaceService，而是注入一个基于 CGLIB 生成的动态代理对象（空壳）。
+     * 只有当代码实际运行，并首次调用 spaceService 的具体方法时，代理对象才会去 Spring 上下文中获取真实的 Bean，
+     * 从而优雅地打破了启动阶段“A等B，B等A”的死锁僵局。
+     */
+    @Lazy
     @Resource
     private SpaceService spaceService;
 
