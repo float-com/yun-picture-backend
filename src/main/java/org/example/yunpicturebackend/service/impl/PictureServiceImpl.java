@@ -21,17 +21,16 @@ import org.example.yunpicturebackend.manager.upload.FilePictureUpload;
 import org.example.yunpicturebackend.manager.upload.PictureUploadTemplate;
 import org.example.yunpicturebackend.manager.upload.UrlPictureUpload;
 import org.example.yunpicturebackend.model.dto.file.UploadPictureResult;
-import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureReviewRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureUploadByBatchRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureUploadRequest;
+import org.example.yunpicturebackend.model.dto.picture.*;
 import org.example.yunpicturebackend.model.entity.Picture;
+import org.example.yunpicturebackend.model.entity.Space;
 import org.example.yunpicturebackend.model.entity.User;
 import org.example.yunpicturebackend.model.enums.PictureReviewStatusEnum;
 import org.example.yunpicturebackend.model.vo.PictureVO;
 import org.example.yunpicturebackend.model.vo.UserVO;
 import org.example.yunpicturebackend.service.PictureService;
 import org.example.yunpicturebackend.mapper.PictureMapper;
+import org.example.yunpicturebackend.service.SpaceService;
 import org.example.yunpicturebackend.service.UserService;
 import org.jsoup.Jsoup;
 import org.springframework.beans.BeanUtils;
@@ -40,7 +39,6 @@ import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
-import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
@@ -81,6 +79,9 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
     @Resource
     private UserService userService;
+
+    @Resource
+    private SpaceService spaceService;
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
@@ -125,14 +126,14 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
      * 上传图片（统一处理新增和更新逻辑）
      * <p>
      * 业务流程：
-     * 1. 权限校验：确保用户已登录。
-     * 2. 更新校验：若携带图片 ID，则防御性校验该记录在数据库中是否存在。
-     * 3. 云端上传：根据 inputSource 类型选择对应的上传策略（文件或 URL），将图片安全上传至 COS，并按用户 ID 隔离存储目录。
+     * 1. 权限与空间校验：确保用户已登录，若指定了图库空间，需严格校验空间的归属权。
+     * 2. 更新校验：若携带图片 ID，则防御性校验该记录在数据库中是否存在，并校验空间一致性。
+     * 3. 云端上传：根据 inputSource 类型选择对应的上传策略（文件或 URL），按“公共图库”或“私有空间”动态隔离底层存储目录。
      * 4. 数据装配：提取云端返回的元数据（宽高、大小、格式等）组装数据库实体。
      * 5. 持久化：利用 saveOrUpdate 特性，根据 ID 的有无，自动执行 INSERT 或 UPDATE。
      *
      * @param inputSource          图片输入源（支持 MultipartFile 物理文件对象，或 String 类型的图片 URL 地址）
-     * @param pictureUploadRequest 图片上传扩展参数（核心用于携带图片 id，区分新增或更新）
+     * @param pictureUploadRequest 图片上传扩展参数（核心用于携带图片 id 区分新增或更新，以及 spaceId 区分所属空间）
      * @param loginUser            当前已认证的登录用户对象
      * @return PictureVO           上传并成功入库后，返回给前端的脱敏视图对象
      */
@@ -140,6 +141,18 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
     public PictureVO uploadPicture(Object inputSource, PictureUploadRequest pictureUploadRequest, User loginUser) {
         // 1. 基础安全拦截：强制要求必须登录后才能执行上传，防范匿名用户恶意传图消耗云端流量和存储
         ThrowUtils.throwIf(loginUser == null, ErrorCode.NO_AUTH_ERROR);
+
+        // 1.5 目标图库空间校验 (核心隔离边界)
+        // 业务逻辑：如果前端传了 spaceId，说明用户想把图片传到特定的私有空间里
+        Long spaceId = pictureUploadRequest.getSpaceId();
+        if (spaceId != null) {
+            Space space = spaceService.getById(spaceId);
+            ThrowUtils.throwIf(space == null, ErrorCode.NOT_FOUND_ERROR, "指定的图库空间不存在");
+            // 越权防御：只能往自己创建的空间里传图片，严禁张三把图片塞进李四的空间里
+            if (!loginUser.getId().equals(space.getUserId())) {
+                throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "无权向该私有空间上传图片");
+            }
+        }
 
         // 2. 提取更新标识（判断当前操作是“全新上传”还是“对旧记录的物理文件替换”）
         Long pictureId = null;
@@ -153,15 +166,10 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 3. 更新操作的防御性编程
         if (pictureId != null) {
             // 3.1 查库获取历史记录
-            // 【架构演进说明】这里舍弃了之前通过 lambdaQuery().exists() 仅判断数据是否存在的轻量级做法。
-            // 原因：Controller 层取消了管理员权限的一刀切拦截后，我们必须获取到该记录的真实拥有者（userId），以便进行后续的越权校验。
             oldPicture = this.getById(pictureId);
             ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR, "图片不存在或已被删除");
 
-            // 3.3 审核状态重置 (可选业务逻辑，视具体需求而定)
-            // 注意：如果用户修改了图片实体文件，通常意味着图片内容发生了变化，此时应当将图片的审核状态打回“待审核”。
-
-//      ///////////////////////////已弃用的代码//////////////////////////////////////
+//      ///////////////////////////已弃用的代码 (保留供复盘参考)//////////////////////////////////////
 //            // 如果是更新动作，必须查库校验待更新的图片记录是否真实存在。
 //            // 避免前端传递虚假 ID 导致后续业务出现脏数据或空指针异常。
 //            boolean exists = this.lambdaQuery()
@@ -169,23 +177,46 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 //                    .exists();
 //            ThrowUtils.throwIf(!exists, ErrorCode.NOT_FOUND_ERROR, "图片不存在");
 //            // 注意：严格的生产环境中，这里可能还需要进一步校验该 pictureId 是否归属于当前 loginUser.getId()，防止水平越权（修改别人的图片）
-//      //////////////////////////////////////////////////////////////////////////
+//      ///////////////////////////////////////////////////////////////////////////////////////////
 
-            // 3.2 水平越权与垂直越权校验
-            // 【业务场景】开放普通用户上传/编辑权限后，必须严防“张三通过抓包修改 pictureId 来覆盖李四的图片”这种高危漏洞。
+            // 3.2 水平越权与垂直越权校验 (注：本段代码正是为了解决上面注释中提到的“防止水平越权”问题而演进的)
             // 【校验逻辑】如果“原图片的归属者”不是“当前登录用户”（防水平越权），
             // 并且“当前登录用户”也不是“管理员”（保留管理员全局管理的特权），则果断拒绝访问。
             if (!oldPicture.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
                 throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "无权编辑他人的图片");
             }
+
+            // 3.3 空间一致性校验 (防数据漂移)
+            // 业务约束：当前接口的定位是“重新上传替换文件”，不支持在替换文件的同时把图片转移到另一个空间。
+            if (spaceId == null) {
+                // 如果本次更新没传 spaceId，为了防止丢失原有的空间归属，必须平滑继承旧图片的 spaceId
+                if (oldPicture.getSpaceId() != null) {
+                    spaceId = oldPicture.getSpaceId();
+                }
+            } else {
+                // 如果本次更新传了 spaceId，必须严格校验它和旧图片原本所在的 spaceId 是否完全一致
+                if (ObjUtil.notEqual(spaceId, oldPicture.getSpaceId())) {
+                    throw new BusinessException(ErrorCode.PARAMS_ERROR, "更新图片时，空间标识不一致");
+                }
+            }
+
+            // 3.4 审核状态重置 (可选业务逻辑，视具体需求而定)
+            // 注意：如果用户修改了图片实体文件，通常意味着图片内容发生了变化，此时应当将图片的审核状态打回“待审核”。
+            // 实际执行位置：下沉至 fillReviewParams() 方法内统管。
         }
 
-        // 4. 动态构造云端对象存储的目录前缀
-        // 策略：按照业务线 (public) + 用户 ID (loginUser.getId()) 划分外层目录
-        // 优势：实现不同用户间的文件物理隔离，不仅方便排查问题，也有利于后续针对单个用户进行空间配额统计或违规资源清理
-        String uploadPathPrefix = String.format("public/%s", loginUser.getId());
+        // 4. 动态构造云端对象存储的目录前缀 (实现云端文件的物理隔离)
+        // 策略：按照目标空间类型进行顶层目录划分
+        String uploadPathPrefix;
+        if (spaceId == null) {
+            // 公共图库：存放在 public 目录下，并按用户 ID 划分子目录
+            uploadPathPrefix = String.format("public/%s", loginUser.getId());
+        } else {
+            // 私有图库：存放在 space 目录下，严格按空间 ID 划分子目录，便于后续基于空间维度的数据管理与清理
+            uploadPathPrefix = String.format("space/%s", spaceId);
+        }
 
-        // 5. 根据 inputSource 的类型动态调度底层的文件或URL上传策略，完成向第三方 COS 的安全上传与图片元数据（CI）解析
+        // 5. 根据 inputSource 的类型动态调度底层的文件或 URL 上传策略，完成向第三方 COS 的安全上传与图片元数据（CI）解析
         PictureUploadTemplate pictureUploadTemplate = filePictureUpload;
         if(inputSource instanceof String){
             pictureUploadTemplate = urlPictureUpload;
@@ -195,14 +226,12 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 6. 数据搬运与装配：将上传成功后的 DTO 结果转换为数据库底层能识别的 Entity 实体
         Picture picture = new Picture();
         picture.setUrl(uploadPictureResult.getUrl());
-        //补充缩略图字段
+        // 补充缩略图字段
         picture.setThumbnailUrl(uploadPictureResult.getThumbnailUrl());
 
         // 6.5 解析与挂载图片名称
-        // 【业务场景】默认情况下，系统会自动从云端返回的元数据或原始物理文件中提取名称作为缺省值。
-        // 但为了支持类似“批量抓取时统一自定义前缀”或“前端用户上传时主动重命名”等高级需求，此处设计了覆盖机制。
-        // 【逻辑说明】优先采用外部扩展请求（pictureUploadRequest）中显式指定的图片名称；
-        // 若外部未传递或传空串，则平滑降级，使用云端上传结果中解析出的默认名称。
+        // 优先采用外部扩展请求（pictureUploadRequest）中显式指定的图片名称；
+        // 若外部未传递，则平滑降级，使用云端上传结果中解析出的默认名称。
         String picName = uploadPictureResult.getPicName();
         if (pictureUploadRequest != null && StrUtil.isNotBlank(pictureUploadRequest.getPicName())) {
             picName = pictureUploadRequest.getPicName();
@@ -214,11 +243,15 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         picture.setPicHeight(uploadPictureResult.getPicHeight());
         picture.setPicScale(uploadPictureResult.getPicScale());
         picture.setPicFormat(uploadPictureResult.getPicFormat());
+
         // 绑定图片归属权，记录数据拥有者
         picture.setUserId(loginUser.getId());
 
+        // 绑定所属图库空间
+        picture.setSpaceId(spaceId);
+
         // 更新字段之前先补充审核参数【极其重要】
-        this.fillReviewParams(picture,loginUser);
+        this.fillReviewParams(picture, loginUser);
 
         // 7. 处理“更新操作”的特有字段逻辑
         if (pictureId != null) {
@@ -1019,6 +1052,148 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         }
 
         return objectKey;
+    }
+
+    /**
+     * 执行图片删除的核心业务流转（统筹校验、鉴权、删除与资源清理）
+     * <p>
+     * 业务编排：
+     * 1. 防御性拦截：确保入参合法，防止无效查询。
+     * 2. 查后删确认：锁定目标记录，为鉴权和清理提供元数据。
+     * 3. 统一鉴权：调度基于空间属性的动态权限策略，拦截越权行为。
+     * 4. 数据擦除：执行数据库层面的记录移除。
+     * 5. 资源释放：同步清理 Redis 分页缓存与对象存储（OSS）中的物理文件。
+     *
+     * @param pictureId 待删除的目标图片主键 ID
+     * @param loginUser 当前已认证的登录用户对象（操作主体）
+     */
+    @Override
+    public void deletePicture(long pictureId, User loginUser) {
+        // 1. 防御性拦截：确保核心入参合法，避免无效的底层 DB 扫描与空指针异常 (NPE)
+        ThrowUtils.throwIf(pictureId <= 0, ErrorCode.PARAMS_ERROR);
+        ThrowUtils.throwIf(loginUser == null, ErrorCode.NO_AUTH_ERROR);
+
+        // 2. 校验目标资源是否存在
+        // 经典的“查后删”模式：必须先查出老数据，不仅是为了确认记录存在，更是为了提取 spaceId 和图片 URL 供后续鉴权和清文件使用
+        Picture oldPicture = this.getById(pictureId);
+        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR);
+
+        // 3. 越权防御与权限校验
+        // 复用核心鉴权路由：将权限判断逻辑收拢至 checkPictureAuth，由其动态决定公共/私有空间的越权拦截策略
+        this.checkPictureAuth(loginUser, oldPicture);
+
+        // 4. 执行数据擦除 (物理/逻辑删除)
+        // 委托给 MyBatis-Plus 底层的 IService 执行移除操作，并严格核验受影响的行数，确保删除真正落地
+        boolean result = this.removeById(pictureId);
+        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+
+        // 5. 缓存一致性处理
+        // 图片元数据销毁后，旧的列表分页缓存即成为脏数据；此处主动失效，防止前端短暂出现“幽灵图片”
+        this.clearPictureVOPageCache();
+
+        // 6. 清理云端物理资源
+        // 释放对象存储上的源文件与相关资源，避免产生闲置的“孤儿文件”导致存储成本白白浪费
+        this.clearPictureFiles(oldPicture);
+    }
+
+    /**
+     * 执行图片编辑的核心业务流转（统筹映射、校验、鉴权、审核与更新）
+     * <p>
+     * 业务编排：
+     * 1. DTO 转换与装配：构建实体对象，更新编辑时间。
+     * 2. 业务属性校验：调用 validPicture 拦截非法数据格式。
+     * 3. 查后改确认：锁定目标记录，提取老数据用于越权比对。
+     * 4. 统一鉴权：调度基于空间属性的动态权限策略。
+     * 5. 审核状态重置：调用 fillReviewParams 根据修改动作重新评估审核状态。
+     * 6. 数据落地与缓存清理。
+     *
+     * @param pictureEditRequest 包含待修改字段的请求 DTO
+     * @param loginUser          当前已认证的登录用户对象（操作主体）
+     */
+    @Override
+    public void editPicture(PictureEditRequest pictureEditRequest, User loginUser) {
+        // 1. 防御性拦截：确保核心入参合法，避免无效操作与空指针异常 (NPE)
+        ThrowUtils.throwIf(pictureEditRequest == null || pictureEditRequest.getId() <= 0, ErrorCode.PARAMS_ERROR);
+        ThrowUtils.throwIf(loginUser == null, ErrorCode.NO_AUTH_ERROR);
+
+        // 2. DTO 实体映射与特殊字段处理
+        // 将前端传来的修改请求对象转换为底层数据库实体，并处理复杂结构（如 List 序列化为 JSON 字符串）
+        Picture picture = new Picture();
+        BeanUtils.copyProperties(pictureEditRequest, picture);
+        picture.setTags(JSONUtil.toJsonStr(pictureEditRequest.getTags()));
+
+        // 业务补充：只要发生编辑，就刷新最后编辑时间，方便后续做“近期修改”排序或缓存淘汰策略
+        picture.setEditTime(new Date());
+
+        // 3. 数据合法性校验
+        // 针对修改后的属性进行业务规则校验（如 URL 格式、名称长度等）
+        this.validPicture(picture);
+
+        // 4. 校验目标资源是否存在
+        // 经典的“查后改”模式：确认底层数据真实存在，并提取旧数据供后续越权比对使用
+        long id = pictureEditRequest.getId();
+        Picture oldPicture = this.getById(id);
+        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR);
+
+        // 5. 越权防御与权限校验
+        // 复用核心鉴权路由：将权限判断逻辑收拢至 checkPictureAuth，由其动态决定越权拦截策略
+        this.checkPictureAuth(loginUser, oldPicture);
+
+        // 6. 补充审核参数 【关键步骤】
+        // 图片内容或元数据发生变更，可能需要重新进入人工审核流；此处根据系统规则和操作者身份重新填充审核状态
+        this.fillReviewParams(picture, loginUser);
+
+        // 7. 执行数据更新
+        // 委托给 MyBatis-Plus 执行修改，并核验底层受影响的行数，确保更新真正落地
+        boolean result = this.updateById(picture);
+        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+
+        // 8. 缓存一致性处理
+        // 普通编辑会影响前端列表的展示内容（如改了名字或标签），写入成功后主动清理旧的分页缓存
+        this.clearPictureVOPageCache();
+    }
+
+
+    /**
+     * 校验图片操作权限（统一处理公共图库与私有空间的越权防御）
+     * <p>
+     * 业务策略：
+     * 1. 基础校验：拦截鉴权主体（用户）与客体（图片）为空的非法请求，防止后续空指针异常。
+     * 2. 路由分发：提取图片的归属空间标识（spaceId），动态选择对应的底层鉴权策略。
+     * 3. 公共图库鉴权 (spaceId 为空)：遵循常规的 RBAC 权限体系，仅允许图片的拥有者（本人）或系统级管理员进行操作。
+     * 4. 私有空间鉴权 (spaceId 非空)：实行绝对的数据隐私隔离，严禁任何人（包括全站超级管理员）窥探或篡改他人私有资产，仅允许该空间的拥有者操作。
+     *
+     * @param loginUser 当前已认证的登录用户对象（鉴权主体）
+     * @param picture   待操作的底层图片实体记录（鉴权客体）
+     * @throws BusinessException 当用户缺失对应操作权限时，抛出 NO_AUTH_ERROR 业务异常直接阻断后续流程
+     */
+    @Override
+    public void checkPictureAuth(User loginUser, Picture picture) {
+        // 1. 防御性拦截：确保鉴权主体与客体均存在，防止后续调用 get 方法时触发空指针异常 (NPE)
+        ThrowUtils.throwIf(loginUser == null || picture == null, ErrorCode.NO_AUTH_ERROR);
+
+        // 2. 提取路由鉴权的核心标识
+        Long spaceId = picture.getSpaceId();
+        Long loginUserId = loginUser.getId();
+
+        // 3. 动态分发鉴权策略
+        if (spaceId == null) {
+            // ==========================================
+            // 策略 A：公共图库权限管控
+            // 规则：仅图片的上传者（本人）或系统级管理员具备修改/删除的权限
+            // ==========================================
+            if (!picture.getUserId().equals(loginUserId) && !userService.isAdmin(loginUser)) {
+                throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "无权操作公共图库中他人的图片");
+            }
+        } else {
+            // ==========================================
+            // 策略 B：私有图库空间权限管控
+            // 规则：绝对的私有化隔离。哪怕是全站管理员，也严禁越权操作他人私有空间内的数据
+            // ==========================================
+            if (!picture.getUserId().equals(loginUserId)) {
+                throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "无权操作他人私有空间内的图片");
+            }
+        }
     }
 
 }

@@ -84,6 +84,11 @@ public class Picture {
     private Long userId;
 
     /**
+     * 归属空间 ID（关联 space 表主键，标识图片所属的私有空间；若为空则表示该图片位于公共图库，用于实现多层级的数据隔离与配额管控）
+     */
+    private Long spaceId;
+
+    /**
      * 记录创建时间（系统插入数据时自动写入）
      */
     private Date createTime;

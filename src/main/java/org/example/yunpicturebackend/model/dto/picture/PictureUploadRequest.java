@@ -24,6 +24,15 @@ public class PictureUploadRequest implements Serializable {
     private Long id;
 
     /**
+     * 归属空间 ID
+     * <p>
+     * 作用：标识当前上传图片所需存放的目标图库空间，用于实现多层级的数据隔离与底层配额管控。
+     * - 若为空 (null)：表示这是一次针对系统“公共图库”的上传操作。
+     * - 若不为空：关联 space 表的主键，表示图片将专属上传至指定的“私有空间”。系统在上传入库前，将依据此 ID 联动触发该空间的容量 (maxSize) 与数量 (maxCount) 限额校验机制。
+     */
+    private Long spaceId;
+
+    /**
      * 文件地址（网络图片 URL）
      * <p>
      * 作用：用于支持基于公网 URL 的图片抓取与转存。

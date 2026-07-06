@@ -160,60 +160,39 @@ public class PictureController {
 
 
     /**
-     * 删除图片接口
+     * 删除图片（统一处理逻辑或物理删除）
+     * <p>
+     * 业务场景：用户主动清理自己的图片，或管理员清理违规图片。系统将目标图片记录从数据库中移除，
+     * 并同步清理相关的云端 OSS 存储文件及前端列表分页缓存。
+     * <p>
+     * 【设计原理】请求方法妥协：
+     * 遵循绝对的 RESTful 规范，删除操作理应使用 @DeleteMapping。但在许多生产环境实践中，为规避部分老旧网关或防火墙
+     * 对 DELETE 请求的拦截，且为了统一使用请求体 (Body) 传递扩展参数，此处统一妥协采用 @PostMapping。
      *
-     * @PostMapping: RESTful 风格的路由注解。
-     * 架构考量：在绝对标准的 REST 规范中，删除应使用 @DeleteMapping。但在许多大厂实践中，
-     * 为了规避某些老旧网关/防火墙对 DELETE 请求的拦截，或者为了统一使用请求体 (Body) 传递扩展参数，往往统一妥协使用 @PostMapping。
-     *
-     * @param deleteRequest 包含待删除图片 ID 的请求体，封装为 DTO 以便后续无缝增加其他参数
-     * @param request       Tomcat 注入的原生 HTTP 请求对象，核心作用是用来校验当前的登录态
-     * @return 包装在统一响应体 BaseResponse 中的布尔值，标识是否删除成功
+     * @param deleteRequest 前端提交的 JSON 格式请求参数，核心包含待删除的图片 id。封装为 DTO 是为了具备良好的后续扩展性。
+     * @param request       Servlet 原生 HTTP 请求对象，用于从中提取当前会话（Session）或 Token，进而获取登录态及校验权限。
+     * @return 统一返回体包装的 Boolean 标志位，true 表示删除操作成功。
      */
     @PostMapping("/delete")
     public BaseResponse<Boolean> deletePicture(
-            /*
-             * @RequestBody: 核心反序列化注解。
-             * 拦截前端发来的 JSON 格式请求体，自动将其装配为底层的 DeleteRequest 数据传输对象。
-             */
             @RequestBody DeleteRequest deleteRequest,
             HttpServletRequest request) {
 
         // 1. 防御性拦截：确保请求载荷合法
-        // 任何依赖 ID 的操作，第一步永远是防空和防非负数。如果这里不拦截，查库时可能会引发全表扫描或底层报错。
+        // Controller 层作为系统入口，需进行 Fail-Fast（快速失败）的基础拦截，避免非法参数（如空载荷或非法 ID）穿透到核心业务层
         if (deleteRequest == null || deleteRequest.getId() <= 0) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR);
         }
 
-        // 2. 提取当前上下文的登录用户
-        // 核心安全准则：永远不要相信前端传来的 userId，一定要从后端的 Session/Token 中去取，防止水平越权。
+        // 2. 获取当前登录用户信息（基于 HTTP Session 或 Token）
+        // 核心安全准则：绝不信任前端传递的 userId，必须从后端安全上下文中提取，以此作为防范水平越权漏洞的基石
         User loginUser = userService.getLoginUser(request);
-        long id = deleteRequest.getId();
 
-        // 3. 校验目标资源是否存在
-        // 经典的“查后删”逻辑：先确认数据库里确实有这条记录，才能进行后续的权限校验。
-        Picture oldPicture = pictureService.getById(id);
-        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR);
+        // 3. 调度 Service 层执行核心删除逻辑
+        // 将查库确认、权限校验（鉴别本人或管理员）、缓存清理与 OSS 资源释放等复杂业务编排，完全下沉并委派给 Service 层处理
+        pictureService.deletePicture(deleteRequest.getId(), loginUser);
 
-        // 4. 越权防御（核心安全机制）
-        // 业务规则：这条图片到底谁能删？只有“图片的创建者”或者“全站管理员”可以。
-        // 如果两者都不是，直接抛出无权限异常，阻断恶意用户的越权删除尝试。
-        if (!oldPicture.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
-            throw new BusinessException(ErrorCode.NO_AUTH_ERROR);
-        }
-
-        // 5. 执行物理/逻辑删除
-        // 委托给 MyBatis-Plus 的 IService 执行删除，并严格校验底层受影响的行数。
-        boolean result = pictureService.removeById(id);
-        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
-
-        // 图片记录删除后，列表分页缓存中的旧数据会失效；主动清理缓存，避免前端短暂继续显示已删除图片
-        pictureService.clearPictureVOPageCache();
-
-        // 清理图片资源
-        pictureService.clearPictureFiles(oldPicture);
-
-        // 6. 统一格式返回
+        // 4. 将操作结果包装为全局统一的标准 JSON 格式并返回
         return ResultUtils.success(true);
     }
 
@@ -624,58 +603,38 @@ public class PictureController {
     }
 
     /**
-     * 编辑图片接口（供普通用户使用）
+     * 编辑图片接口（面向普通用户与空间成员）
+     * <p>
+     * 业务场景：用户对已上传的图片进行元数据修改（如名称、标签、简介等）。
+     * <p>
+     * 【设计原理】Edit 与 Update 的职责边界：
+     * 1. 业务对象不同：Update 面向全局管理员，允许全量覆盖；Edit 面向普通用户，通常只允许修改系统开放的部分字段。
+     * 2. 权限维度不同：Update 靠顶层的 @AuthCheck 一刀切拦截；Edit 必须深入业务层动态校验“你是不是这张图片的主人或空间管理员”。
      *
-     * Edit (编辑) 和 Update (更新) 的核心区别是什么？
-     * 1. 业务对象不同：Update 面向管理员，允许全量覆盖；Edit 面向普通用户，通常只允许修改系统开放的部分字段（如名字、标签）。
-     * 2. 权限维度不同：Update 靠 @AuthCheck 一刀切拦截；Edit 必须在代码深处校验“你是不是这张图片的主人”。
-     *
-     * @param pictureEditRequest  包含修改字段的请求 DTO
-     * @param request             HTTP 原生请求对象，用于鉴权
-     * @return 统一响应体，编辑成功返回 true
+     * @param pictureEditRequest 包含待修改字段的请求 DTO。使用 DTO 限制了用户只能修改暴露的特定字段，防范恶意覆盖核心属性。
+     * @param request            Servlet 原生 HTTP 请求对象，用于从中提取当前会话（Session）或 Token，进而获取登录态。
+     * @return 统一返回体包装的 Boolean 标志位，true 表示编辑操作成功。
      */
     @PostMapping("/edit")
-    public BaseResponse<Boolean> editPicture(@RequestBody PictureEditRequest pictureEditRequest, HttpServletRequest request) {
+    public BaseResponse<Boolean> editPicture(
+            @RequestBody PictureEditRequest pictureEditRequest,
+            HttpServletRequest request) {
 
-        // 1. 基础防空
+        // 1. 防御性拦截：确保请求载荷合法
+        // Controller 层作为系统入口进行 Fail-Fast 基础拦截，避免非法参数穿透到核心业务层
         if (pictureEditRequest == null || pictureEditRequest.getId() <= 0) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR);
         }
 
-        // 2. DTO 映射及特殊字段处理
-        Picture picture = new Picture();
-        BeanUtils.copyProperties(pictureEditRequest, picture);
-        //注意将List 转为 String
-        picture.setTags(JSONUtil.toJsonStr(pictureEditRequest.getTags()));
-
-        // 业务补充：只要发生编辑，就刷新最后编辑时间，方便后续做“近期修改”排序或缓存失效策略
-        picture.setEditTime(new Date());
-
-        // 3. 合法性检查
-        pictureService.validPicture(picture);
-
+        // 2. 获取当前登录用户信息（基于 HTTP Session 或 Token）
+        // 核心安全准则：绝不信任前端传递的用户身份，必须从后端安全上下文中提取，作为防范越权的基石
         User loginUser = userService.getLoginUser(request);
 
-        //补充审核参数【非常重要】
-        pictureService.fillReviewParams(picture,loginUser);
-        long id = pictureEditRequest.getId();
+        // 3. 调度 Service 层执行核心编辑逻辑
+        // 将 DTO 转换、合法性校验、权限核验、审核状态重置及数据库更新等复杂业务编排，完全下沉并委派给 Service 层处理
+        pictureService.editPicture(pictureEditRequest, loginUser);
 
-        // 4. 提取原数据准备越权校验
-        Picture oldPicture = pictureService.getById(id);
-        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR);
-
-        // 5. 核心越权防御
-        // 逻辑：如果“原图片的归属者”不是“当前登录用户”，并且“当前登录用户”也不是“管理员”，则拒绝访问。
-        if (!oldPicture.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
-            throw new BusinessException(ErrorCode.NO_AUTH_ERROR);
-        }
-
-        // 6. 落库保存
-        boolean result = pictureService.updateById(picture);
-        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
-
-        // 普通编辑会影响列表展示内容，写入成功后清理图片列表缓存
-        pictureService.clearPictureVOPageCache();
+        // 4. 将操作结果包装为全局统一的标准 JSON 格式并返回
         return ResultUtils.success(true);
     }
 

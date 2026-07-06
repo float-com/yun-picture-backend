@@ -2,10 +2,8 @@ package org.example.yunpicturebackend.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
-import org.example.yunpicturebackend.model.dto.picture.PictureQueryRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureReviewRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureUploadByBatchRequest;
-import org.example.yunpicturebackend.model.dto.picture.PictureUploadRequest;
+import org.example.yunpicturebackend.exception.BusinessException;
+import org.example.yunpicturebackend.model.dto.picture.*;
 import org.example.yunpicturebackend.model.entity.Picture;
 import com.baomidou.mybatisplus.extension.service.IService;
 import org.example.yunpicturebackend.model.entity.User;
@@ -160,4 +158,53 @@ public interface PictureService extends IService<Picture> {
      * @param oldPicture 包含旧对象键（Key）等关联信息的历史图片实体，用于精准定位并执行云端清理操作
      */
     void clearPictureFiles(Picture oldPicture);
+
+    /**
+     * 删除图片 (封装核心业务编排)
+     * <p>
+     * 业务场景：当系统接收到删除图片的请求时（无论是来自控制器层的用户主动删除，还是内部定时任务的自动清理），
+     * 统一调用此核心方法进行业务流转。
+     * 核心编排：
+     * 1. 存在性校验：通过“查后删”机制确保底层数据记录真实存在。
+     * 2. 安全鉴权：复用统一鉴权路由，拦截非法越权删除行为。
+     * 3. 状态一致性：在完成数据库的物理/逻辑删除后，同步清理相关的分页缓存与云存储物理资源。
+     *
+     * @param pictureId 待删除的目标图片主键 ID
+     * @param loginUser 当前已认证的登录用户上下文实体，用于后续的权限核验
+     * @throws BusinessException (NOT_FOUND_ERROR/NO_AUTH_ERROR/OPERATION_ERROR) 资源不存在、鉴权失败或底层删除失败时抛出
+     */
+    void deletePicture(long pictureId, User loginUser);
+
+
+    /**
+     * 编辑图片 (封装核心业务编排)
+     * <p>
+     * 业务场景：当普通用户或空间管理员请求修改图片元数据（如名称、标签、简介等）时，
+     * 统一调用此核心方法进行业务流转。
+     * 核心编排：
+     * 1. 实体映射：将前端传入的 DTO 转换为底层数据库实体，并处理复杂字段（如 JSON 序列化）。
+     * 2. 合法校验：校验修改后的属性是否符合系统业务规则。
+     * 3. 安全鉴权：复用统一鉴权路由，拦截越权编辑行为。
+     * 4. 审核流转：根据用户身份和系统策略，重置或补充图片的审核状态。
+     * 5. 状态一致性：执行数据库更新后，同步清理相关的分页缓存。
+     *
+     * @param pictureEditRequest 包含待修改字段的请求 DTO
+     * @param loginUser          当前已认证的登录用户上下文实体，用于权限核验与审核参数填充
+     * @throws BusinessException (NOT_FOUND_ERROR/NO_AUTH_ERROR/OPERATION_ERROR) 资源不存在、鉴权失败或更新失败时抛出
+     */
+    void editPicture(PictureEditRequest pictureEditRequest, User loginUser);
+
+    /**
+     * 校验图片操作权限 (核心鉴权路由)
+     * <p>
+     * 业务场景：在执行图片的编辑、删除等高危操作前统一调用，实现基于空间属性的动态权限管控。
+     * 权限策略：
+     * 1. 公共图库 (spaceId == null)：遵循常规的 RBAC 权限。图片的拥有者（本人）或全站超级管理员具备操作权限。
+     * 2. 私有空间 (spaceId != null)：遵循严格的属主隔离机制（数据隐私孤岛）。哪怕是系统管理员，也严禁窥探或篡改他人私有空间内的资产，仅允许该空间的拥有者进行操作。
+     *
+     * @param loginUser 当前已认证的登录用户上下文实体
+     * @param picture   待操作的底层图片实体记录
+     * @throws BusinessException (NO_AUTH_ERROR) 当鉴权失败时，直接抛出业务异常阻断后续请求流程
+     */
+    void checkPictureAuth(User loginUser, Picture picture);
 }
