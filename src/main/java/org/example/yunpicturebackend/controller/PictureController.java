@@ -283,6 +283,14 @@ public class PictureController {
         // 1. 查询数据库获取底层实体
         Picture picture = pictureService.getById(id);
         ThrowUtils.throwIf(picture == null, ErrorCode.NOT_FOUND_ERROR);
+
+        // 空间权限校验
+        Long spaceId = picture.getSpaceId();
+        if (spaceId != null) {
+            User loginUser = userService.getLoginUser(request);
+            pictureService.checkPictureAuth(loginUser, picture);
+        }
+
         // 2. 转换为视图对象并返回
         return ResultUtils.success(pictureService.getPictureVO(picture, request));
     }

@@ -317,7 +317,9 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         Integer reviewStatus = pictureQueryRequest.getReviewStatus();
         String reviewMessage = pictureQueryRequest.getReviewMessage();
         Long reviewerId = pictureQueryRequest.getReviewerId();
-
+        // 空间隔离相关字段：spaceId 指定私有空间，nullSpaceId 表示仅查询公共图库
+        Long spaceId = pictureQueryRequest.getSpaceId();
+        boolean nullSpaceId = pictureQueryRequest.isNullSpaceId();
 
         // 3. 聚合搜索（多字段组合模糊查询）
         if (StrUtil.isNotBlank(searchText)) {
@@ -347,11 +349,10 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         queryWrapper.eq(ObjUtil.isNotEmpty(reviewStatus), "reviewStatus", reviewStatus);
         // 动态拼接等值查询 (eq)：当操作人 ID 不为空时生效，用于筛选特定审核员处理的图片
         queryWrapper.eq(ObjUtil.isNotEmpty(reviewerId), "reviewerId", reviewerId);
-
-
-
-
-
+        // 动态拼接等值查询 (eq)：当空间 ID 不为空时，限定只查询指定私有空间下的图片
+        queryWrapper.eq(ObjUtil.isNotEmpty(spaceId), "spaceId", spaceId);
+        // 动态拼接空值查询：公共图库图片的 spaceId 必须为空，防止私有空间图片混入公开列表
+        queryWrapper.isNull(nullSpaceId, "spaceId");
 
 
         // 5. JSON 数组字段查询 (tags)
@@ -468,9 +469,25 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         long current = pictureQueryRequest.getCurrent();
         long size = pictureQueryRequest.getPageSize();
 
-        // 2. 权限隔离：C 端查询默认仅展示已过审图片
-        // 注意：必须在生成缓存 Key 前设置状态，保证同一业务场景生成的缓存 Key 一致
-        pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
+        // 2. 空间权限隔离：必须在生成缓存 Key 前完成权限约束补齐
+        // 原因：多级缓存是跨请求共享的，如果权限条件没有进入 Key，就可能发生公共图库与私有空间数据串读。
+        Long spaceId = pictureQueryRequest.getSpaceId();
+        if (spaceId == null) {
+            // 公共图库：普通用户只能查看已过审且不属于任何私有空间的图片
+            pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
+            pictureQueryRequest.setNullSpaceId(true);
+        } else {
+            // 私有空间：必须登录，并且只能查询自己创建的空间下的图片
+            User loginUser = userService.getLoginUser(request);
+            Space space = spaceService.getById(spaceId);
+            ThrowUtils.throwIf(space == null, ErrorCode.NOT_FOUND_ERROR, "空间不存在");
+            if (!loginUser.getId().equals(space.getUserId())) {
+                throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "没有空间权限");
+            }
+            // 私有空间没有公共审核展示限制，避免把用户自己的待审核/未审核图片过滤掉
+            pictureQueryRequest.setReviewStatus(null);
+            pictureQueryRequest.setNullSpaceId(false);
+        }
 
         // 3. 构建多级缓存共享 Key
         String cacheKey = buildPictureVOPageCacheKey(pictureQueryRequest);
