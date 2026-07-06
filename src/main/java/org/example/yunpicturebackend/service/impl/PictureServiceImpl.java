@@ -5,6 +5,7 @@ import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.ObjUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -38,6 +39,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.DigestUtils;
 
 import javax.annotation.Resource;
@@ -50,6 +52,7 @@ import java.util.LinkedHashSet;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -82,6 +85,9 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
     @Resource
     private SpaceService spaceService;
+
+    @Resource
+    private TransactionTemplate transactionTemplate;
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
@@ -144,6 +150,9 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
         // 1.5 目标图库空间校验 (核心隔离边界)
         // 业务逻辑：如果前端传了 spaceId，说明用户想把图片传到特定的私有空间里
+        if (pictureUploadRequest == null) {
+            pictureUploadRequest = new PictureUploadRequest();
+        }
         Long spaceId = pictureUploadRequest.getSpaceId();
         if (spaceId != null) {
             Space space = spaceService.getById(spaceId);
@@ -151,6 +160,13 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             // 越权防御：只能往自己创建的空间里传图片，严禁张三把图片塞进李四的空间里
             if (!loginUser.getId().equals(space.getUserId())) {
                 throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "无权向该私有空间上传图片");
+            }
+            // 配额预检：新增图片时先拦截明显超额的空间，避免无意义地上传到对象存储后再失败
+            if (pictureUploadRequest.getId() == null && space.getTotalCount() >= space.getMaxCount()) {
+                throw new BusinessException(ErrorCode.OPERATION_ERROR, "空间条数不足");
+            }
+            if (pictureUploadRequest.getId() == null && space.getTotalSize() >= space.getMaxSize()) {
+                throw new BusinessException(ErrorCode.OPERATION_ERROR, "空间大小不足");
             }
         }
 
@@ -260,11 +276,71 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             // 强制刷新业务层面的手动编辑时间
             picture.setEditTime(new Date());
         }
+        //================================================================================================================
+        // ==========================================
+        // 8. 统一持久化入库与空间额度同步扣减 (核心事务块)
+        // ==========================================
+        // 业务场景：将图片元数据保存到数据库，并同步更新该图片所属空间的容量和数量统计。
+        // 核心挑战：必须严格保证“图片落库”与“空间额度扣减”这两个动作的原子性（要么都成功，要么都回滚），绝不能出现图片传上去了，但空间额度没扣的脏状态。
 
-        // 8. 统一持久化入库
-        // 机制：底层会自动判断 picture 对象的 id 是否为空，若为空执行 insert，非空则执行 updateById
-        boolean result = this.saveOrUpdate(picture);
-        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片上传失败");
+        // 1. 变量提升与 Final 化处理
+        // 底层逻辑：Java 语言规范要求，在 Lambda 表达式（如底层的 transactionTemplate 闭包）中引用的外部局部变量，必须是 final 或 effectively final 的。
+        Long finalSpaceId = spaceId;
+        Long finalPictureId = pictureId;
+        Picture finalOldPicture = oldPicture;
+
+        // 2. 编程式事务开启
+        // 架构考量：这里刻意使用了 transactionTemplate 编程式事务，而不是在方法头上加 @Transactional 注解。
+        // 原因：通常在入库前，系统已经经历了耗时的网络 I/O 操作（如将图片文件流上传到腾讯云 COS 等）。
+        // 如果使用 @Transactional，整个大方法都会被事务包裹，会导致数据库连接长时间被占用，严重降低系统吞吐量。
+        // 采用编程式事务可以做到“极致的细粒度控制”，仅将最核心的 DB 操作放进事务里。
+        transactionTemplate.execute(status -> {
+
+            // 3. 执行图片数据的物理落库
+            // 委托 MyBatis-Plus 的 saveOrUpdate：框架底层会根据 picture 是否携带主键 ID，自动路由执行 INSERT 或 UPDATE。
+            boolean result = this.saveOrUpdate(picture);
+            ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片上传失败");
+
+            // 4. 空间额度同步计算与更新 (仅限私有空间)
+            if (finalSpaceId != null) {
+
+                // 4.1 精确计算容量与数量的增量 (Delta)
+                // 逻辑：如果是“重新上传替换旧图”，且新图比老图大，sizeDelta 为正；若新图被压缩变小了，sizeDelta 为负（即释放额度）。如果是“全新上传”，老图大小视为 0。
+                // 使用 Optional 安全处理 null 值，防止引发空指针异常 NPE。
+                long oldPicSize = finalPictureId == null || finalOldPicture == null ? 0L : Optional.ofNullable(finalOldPicture.getPicSize()).orElse(0L);
+                long newPicSize = Optional.ofNullable(picture.getPicSize()).orElse(0L);
+                long sizeDelta = newPicSize - oldPicSize;
+
+                // 逻辑：全新上传 countDelta = 1；替换已有图片则空间内总文件数不变，countDelta = 0
+                long countDelta = finalPictureId == null ? 1L : 0L;
+
+                // 4.2 构建原子更新条件 (DB 层面防超卖与并发安全)
+                UpdateWrapper<Space> updateWrapper = new UpdateWrapper<Space>()
+                        .eq("id", finalSpaceId)
+                        // 高并发防御 1：当且仅当空间占用确实变大时 (sizeDelta > 0)，才在 SQL WHERE 条件中加上剩余容量的校验。
+                        // 借助数据库自带的行级互斥锁，保证 totalSize + 增量 绝对不能超过 maxSize。
+                        .apply(sizeDelta > 0, "totalSize + {0} <= maxSize", sizeDelta)
+                        // 高并发防御 2：同理，新增图片时校验总数量不超过上限。
+                        .apply(countDelta > 0, "totalCount < maxCount")
+                        // 并发安全：必须使用 setSql 直接在 DB 端进行数值增减运算 (totalSize = totalSize + delta)。
+                        // 绝对禁止在 Java 内存中查出老值，算好后再 set 进去，那会导致极其严重的并发脏写（Lost Update）问题！
+                        .setSql("totalSize = totalSize + " + sizeDelta)
+                        .setSql("totalCount = totalCount + " + countDelta);
+
+                // 4.3 触发额度更新
+                // 性能优化：如果容量和数量都没有变化（例如用户只是改了图片的名字/标签），直接通过短路逻辑跳过 DB 更新，避免产生无意义的 SQL I/O。
+                boolean update = sizeDelta == 0 && countDelta == 0 || spaceService.update(updateWrapper);
+
+                // 4.4 失败回滚
+                // 如果 update 为 false，说明上面 updateWrapper 中的 .apply() 条件没有被满足（即空间额度或数量超限了）。
+                // 此时抛出业务异常，整个 transactionTemplate 代码块会捕获异常并自动触发 DB 回滚，刚才落库的图片记录也会被安全撤销。
+                ThrowUtils.throwIf(!update, ErrorCode.OPERATION_ERROR, "空间额度不足");
+            }
+
+            // 5. 提交并返回最新实体
+            return picture;
+        });
+        //================================================================================================================
 
         // 图片列表接口使用了多级缓存；新增或替换图片成功后，必须主动清理列表缓存，避免前端继续看到旧分页结果。
         this.clearPictureVOPageCache();
@@ -1099,10 +1175,51 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 复用核心鉴权路由：将权限判断逻辑收拢至 checkPictureAuth，由其动态决定公共/私有空间的越权拦截策略
         this.checkPictureAuth(loginUser, oldPicture);
 
-        // 4. 执行数据擦除 (物理/逻辑删除)
-        // 委托给 MyBatis-Plus 底层的 IService 执行移除操作，并严格核验受影响的行数，确保删除真正落地
-        boolean result = this.removeById(pictureId);
-        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        //================================================================================================================
+        // ==========================================
+        // 4. 执行数据擦除与空间额度释放 (核心事务块)
+        // ==========================================
+        // 业务场景：当图片被彻底删除时，除了移除图片记录本身，还必须将该图片占用的存储容量 (Size) 和数量配额 (Count) 归还给对应的私有空间。
+        // 核心挑战：保证“删图”与“退额度”的绝对一致性（ACID 特性）。绝不能出现图片删了，但空间额度没退回来（导致用户空间被永久吞噬）的严重 Bug。
+
+        transactionTemplate.execute(status -> {
+
+            // 1. 执行图片数据的物理/逻辑删除
+            // 委托底层框架移除当前图片记录。如果在执行此步骤时发生异常，事务将自动中止。
+            boolean result = this.removeById(pictureId);
+            ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+
+            // 2. 判断是否需要处理空间额度回退
+            // 提取这张老图片的归属空间标识。如果 spaceId 为 null，说明这是公共图库的图片，不需要管理额度，直接 return true 结束事务即可。
+            Long spaceId = oldPicture.getSpaceId();
+            if (spaceId != null) {
+
+                // 3. 空间额度同步回退核心逻辑
+                // 3.1 安全提取待释放的物理容量
+                // 采用 Optional 防御性编程，应对早期可能遗留的 picSize 为 null 的脏数据，将其默认视为 0L，防止引发 NPE。
+                long oldPicSize = Optional.ofNullable(oldPicture.getPicSize()).orElse(0L);
+
+                // 3.2 构建并执行并发安全的更新语句
+                // 架构考量（高并发防御）：
+                // 绝对禁止写成：查出老空间 -> Java 内存中做减法 (newSize = oldSize - oldPicSize) -> update 进去。
+                // 因为在极高并发的批量删除场景下，Java 内存计算会引发严重的“丢失更新（脏写）”问题。
+                // 正确做法：必须通过 setSql 直接把数学运算交给底层数据库引擎（利用 DB 的行锁机制），执行类似于 `UPDATE space SET totalSize = totalSize - X WHERE id = Y` 的原子操作。
+                boolean update = spaceService.lambdaUpdate()
+                        .eq(Space::getId, spaceId)
+                        .setSql("totalSize = totalSize - " + oldPicSize)
+                        .setSql("totalCount = totalCount - 1")
+                        .update();
+
+                // 3.3 失败回滚机制
+                // 如果额度更新失败（例如并发死锁或底层 DB 异常），立即抛出异常。
+                // 此时外层的 transactionTemplate 会捕获该异常，并把第 1 步已经成功删除的图片记录自动回滚（恢复），确保系统状态的绝对一致。
+                ThrowUtils.throwIf(!update, ErrorCode.OPERATION_ERROR, "额度更新失败");
+            }
+
+            // 4. 事务顺利完结
+            return true;
+        });
+        //================================================================================================================
 
         // 5. 缓存一致性处理
         // 图片元数据销毁后，旧的列表分页缓存即成为脏数据；此处主动失效，防止前端短暂出现“幽灵图片”

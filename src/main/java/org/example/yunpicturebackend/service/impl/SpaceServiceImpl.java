@@ -9,22 +9,28 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import org.example.yunpicturebackend.exception.BusinessException;
 import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
+import org.example.yunpicturebackend.event.PictureCacheClearEvent;
+import org.example.yunpicturebackend.mapper.PictureMapper;
 import org.example.yunpicturebackend.model.dto.space.SpaceAddRequest;
 import org.example.yunpicturebackend.model.dto.space.SpaceQueryRequest;
+import org.example.yunpicturebackend.model.entity.Picture;
 import org.example.yunpicturebackend.model.entity.Space;
 import org.example.yunpicturebackend.model.entity.User;
 import org.example.yunpicturebackend.model.enums.SpaceLevelEnum;
+import org.example.yunpicturebackend.model.enums.SpaceTypeEnum;
 import org.example.yunpicturebackend.model.vo.SpaceVO;
 import org.example.yunpicturebackend.model.vo.UserVO;
 import org.example.yunpicturebackend.service.SpaceService;
 import org.example.yunpicturebackend.mapper.SpaceMapper;
 import org.example.yunpicturebackend.service.UserService;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -41,8 +47,27 @@ import java.util.stream.Collectors;
 public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
     implements SpaceService{
 
+    /**
+     * 空间管理员完整权限列表
+     * <p>
+     * 业务场景：私有空间创建者和系统管理员进入空间详情页时，应能看到上传、编辑、删除、成员管理等操作入口。
+     */
+    private static final List<String> SPACE_ADMIN_PERMISSION_LIST = Arrays.asList(
+            "spaceUser:manage",
+            "picture:view",
+            "picture:upload",
+            "picture:edit",
+            "picture:delete"
+    );
+
     @Resource
     private  UserService userService;
+
+    @Resource
+    private PictureMapper pictureMapper;
+
+    @Resource
+    private ApplicationEventPublisher applicationEventPublisher;
 
     @Resource
     private TransactionTemplate transactionTemplate;
@@ -75,6 +100,9 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
         // 2. 初始化默认值：提升接口的业务包容性
         if (StrUtil.isBlank(spaceAddRequest.getSpaceName())) {
             space.setSpaceName("默认空间");
+        }
+        if (spaceAddRequest.getSpaceType() == null) {
+            space.setSpaceType(SpaceTypeEnum.PRIVATE.getValue());
         }
         if (spaceAddRequest.getSpaceLevel() == null) {
             space.setSpaceLevel(SpaceLevelEnum.COMMON.getValue());
@@ -124,6 +152,42 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
         }
     }
 
+    /**
+     * 删除图库空间，并关联清理空间内图片
+     * <p>
+     * 业务场景：当空间被删除时，空间内图片已经失去归属容器，必须同步删除图片记录，避免后续列表查询出现孤立数据。
+     * 事务边界：空间记录删除与图片记录删除共同提交；云端物理文件清理由图片模块的异步清理能力兜底，不阻塞空间删除主流程。
+     *
+     * @param spaceId   待删除的空间 ID
+     * @param loginUser 当前已认证的登录用户对象
+     */
+    @Override
+    public void deleteSpace(long spaceId, User loginUser) {
+        // 1. 基础防御：校验空间 ID 与登录态，避免非法请求继续穿透到数据库层
+        ThrowUtils.throwIf(spaceId <= 0, ErrorCode.PARAMS_ERROR);
+        ThrowUtils.throwIf(loginUser == null, ErrorCode.NO_AUTH_ERROR);
+
+        // 2. 查后删确认：删除前必须锁定旧空间，用于存在性确认和归属权限校验
+        Space oldSpace = this.getById(spaceId);
+        ThrowUtils.throwIf(oldSpace == null, ErrorCode.NOT_FOUND_ERROR);
+
+        // 3. 核心越权防御：仅空间创建者或系统管理员允许删除空间
+        if (!oldSpace.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR);
+        }
+
+        // 4. 事务化删除：空间与空间内图片记录必须作为一个整体删除，避免产生孤立图片
+        transactionTemplate.execute(status -> {
+            pictureMapper.delete(new QueryWrapper<Picture>().eq("spaceId", spaceId));
+            boolean removeSpace = this.removeById(spaceId);
+            ThrowUtils.throwIf(!removeSpace, ErrorCode.OPERATION_ERROR, "删除空间失败");
+            return true;
+        });
+
+        // 5. 缓存一致性处理：空间内图片集合已变化，需要清理图片分页 VO 缓存
+        applicationEventPublisher.publishEvent(new PictureCacheClearEvent());
+    }
+
 
     /**
      * 构建图库空间查询的 MyBatis-Plus 包装类 (QueryWrapper)
@@ -147,6 +211,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
         Long id = spaceQueryRequest.getId();
         Long userId = spaceQueryRequest.getUserId();
         String spaceName = spaceQueryRequest.getSpaceName();
+        Integer spaceType = spaceQueryRequest.getSpaceType();
         Integer spaceLevel = spaceQueryRequest.getSpaceLevel();
         String sortField = spaceQueryRequest.getSortField();
         String sortOrder = spaceQueryRequest.getSortOrder();
@@ -155,6 +220,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
         // 技巧：利用 MyBatis-Plus 提供的方法首参 condition（返回 true 才拼接该条件），避免繁琐的 if 判空
         queryWrapper.eq(ObjUtil.isNotEmpty(id), "id", id);
         queryWrapper.eq(ObjUtil.isNotEmpty(userId), "userId", userId);
+        queryWrapper.eq(ObjUtil.isNotEmpty(spaceType), "spaceType", spaceType);
         queryWrapper.eq(ObjUtil.isNotEmpty(spaceLevel), "spaceLevel", spaceLevel);
         queryWrapper.like(StrUtil.isNotBlank(spaceName), "spaceName", spaceName);
 
@@ -185,6 +251,12 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
             // 将用户实体脱敏为 UserVO 并设置到空间 VO 中
             UserVO userVO = userService.getUserVO(user);
             spaceVO.setUser(userVO);
+        }
+
+        // 3. 权限填充：空间拥有者或系统管理员拥有该空间的完整管理权限，供前端控制操作按钮展示
+        User loginUser = userService.getLoginUser(request);
+        if (loginUser.getId().equals(space.getUserId()) || userService.isAdmin(loginUser)) {
+            spaceVO.setPermissionList(SPACE_ADMIN_PERMISSION_LIST);
         }
 
         return spaceVO;
@@ -263,15 +335,21 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
 
         // 2. 提取需要校验的核心字段
         String spaceName = space.getSpaceName();
+        Integer spaceType = space.getSpaceType();
         Integer spaceLevel = space.getSpaceLevel();
+        SpaceTypeEnum spaceTypeEnum = SpaceTypeEnum.getEnumByValue(spaceType);
         SpaceLevelEnum spaceLevelEnum = SpaceLevelEnum.getEnumByValue(spaceLevel);
 
         // 3. 核心规则校验
         // 新增场景校验：创建数据时，必须提供空间名称和空间级别进行初始化
         if (add) {
             ThrowUtils.throwIf(StrUtil.isBlank(spaceName), ErrorCode.PARAMS_ERROR, "空间名称不能为空");
+            ThrowUtils.throwIf(spaceType == null, ErrorCode.PARAMS_ERROR, "空间类型不能为空");
             ThrowUtils.throwIf(spaceLevel == null, ErrorCode.PARAMS_ERROR, "空间级别不能为空");
         }
+
+        // 类型有效性校验：若传入了空间类型，需确保其在系统定义的枚举范围内
+        ThrowUtils.throwIf(spaceType != null && spaceTypeEnum == null, ErrorCode.PARAMS_ERROR, "空间类型不存在");
 
         // 级别有效性校验：若传入了空间级别，需确保其在系统定义的枚举范围内 (防止绕过前端传入非法越权级别)
         ThrowUtils.throwIf(spaceLevel != null && spaceLevelEnum == null, ErrorCode.PARAMS_ERROR, "空间级别不存在");

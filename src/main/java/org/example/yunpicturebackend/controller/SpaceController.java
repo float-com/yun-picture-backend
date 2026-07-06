@@ -12,10 +12,12 @@ import org.example.yunpicturebackend.exception.ErrorCode;
 import org.example.yunpicturebackend.exception.ThrowUtils;
 import org.example.yunpicturebackend.model.dto.space.SpaceAddRequest;
 import org.example.yunpicturebackend.model.dto.space.SpaceEditRequest;
+import org.example.yunpicturebackend.model.dto.space.SpaceLevel;
 import org.example.yunpicturebackend.model.dto.space.SpaceQueryRequest;
 import org.example.yunpicturebackend.model.dto.space.SpaceUpdateRequest;
 import org.example.yunpicturebackend.model.entity.Space;
 import org.example.yunpicturebackend.model.entity.User;
+import org.example.yunpicturebackend.model.enums.SpaceLevelEnum;
 import org.example.yunpicturebackend.model.vo.SpaceVO;
 import org.example.yunpicturebackend.service.SpaceService;
 import org.example.yunpicturebackend.service.UserService;
@@ -24,6 +26,9 @@ import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * 图库空间模块对外 HTTP 接口 (Controller 层)
@@ -91,19 +96,8 @@ public class SpaceController {
         User loginUser = userService.getLoginUser(request);
         long id = deleteRequest.getId();
 
-        // 3. 校验目标资源是否存在 (查后删)
-        Space oldSpace = spaceService.getById(id);
-        ThrowUtils.throwIf(oldSpace == null, ErrorCode.NOT_FOUND_ERROR);
-
-        // 4. 核心越权防御
-        // 业务规则：仅空间的“创建者”或“全站管理员”有权删除。
-        if (!oldSpace.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
-            throw new BusinessException(ErrorCode.NO_AUTH_ERROR);
-        }
-
-        // 5. 执行逻辑/物理删除
-        boolean result = spaceService.removeById(id);
-        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        // 3. 核心业务调度：删除空间及其关联图片，具体权限校验与事务控制下沉至 Service 层
+        spaceService.deleteSpace(id, loginUser);
 
         return ResultUtils.success(true);
     }
@@ -228,6 +222,27 @@ public class SpaceController {
         ThrowUtils.throwIf(space == null, ErrorCode.NOT_FOUND_ERROR);
         // 2. 转换为脱敏视图对象（含创建者信息嵌套）并返回
         return ResultUtils.success(spaceService.getSpaceVO(space, request));
+    }
+
+    /**
+     * 获取空间级别列表
+     * <p>
+     * 业务场景：前端创建或升级空间时，需要展示系统支持的空间级别、展示文案以及对应的容量/数量配额。
+     * 设计说明：直接由后端枚举统一转换，避免前端硬编码空间权益导致展示和实际配额不一致。
+     *
+     * @return 包含所有空间级别配置的统一响应体
+     */
+    @GetMapping("/list/level")
+    public BaseResponse<List<SpaceLevel>> listSpaceLevel() {
+        // 1. 枚举转换：将系统内部空间级别枚举映射为前端可直接渲染的 DTO 列表
+        List<SpaceLevel> spaceLevelList = Arrays.stream(SpaceLevelEnum.values())
+                .map(spaceLevelEnum -> new SpaceLevel(
+                        spaceLevelEnum.getValue(),
+                        spaceLevelEnum.getText(),
+                        spaceLevelEnum.getMaxCount(),
+                        spaceLevelEnum.getMaxSize()))
+                .collect(Collectors.toList());
+        return ResultUtils.success(spaceLevelList);
     }
 
     /**

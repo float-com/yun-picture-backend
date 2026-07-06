@@ -24,6 +24,14 @@ public class SpaceAddRequest implements Serializable {
     private String spaceName;
 
     /**
+     * 空间类型
+     * <p>
+     * 作用：区分私有空间和团队空间（枚举值：0-私有空间; 1-团队空间）。
+     * - 业务限制：若前端未传递，后端默认创建私有空间。
+     */
+    private Integer spaceType;
+
+    /**
      * 空间级别
      * <p>
      * 作用：决定新创建空间的权益与配额策略（枚举值：0-普通版; 1-专业版; 2-旗舰版）。

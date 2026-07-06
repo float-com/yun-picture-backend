@@ -39,6 +39,13 @@ public class SpaceQueryRequest extends PageRequest implements Serializable {
     private String spaceName;
 
     /**
+     * 空间类型
+     * <p>
+     * 作用：基于空间类型精确过滤（0-私有空间 1-团队空间）。
+     */
+    private Integer spaceType;
+
+    /**
      * 空间级别
      * <p>
      * 作用：基于等级的精确过滤（0-普通版 1-专业版 2-旗舰版）。

@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS space
     -- 基础核心字段
     id           BIGINT AUTO_INCREMENT                  COMMENT '主键 ID（使用 BIGINT 便于后期扩展为雪花算法等分布式 ID）' PRIMARY KEY,
     spaceName    VARCHAR(128)                           NULL COMMENT '空间名称（用于前端空间列表展示和基础搜索）',
+    spaceType    INT          DEFAULT 0                 NOT NULL COMMENT '空间类型（枚举值：0-私有空间; 1-团队空间。用于区分个人私有图库与团队协作空间）',
     spaceLevel   INT          DEFAULT 0                 NULL COMMENT '空间级别（枚举值：0-普通版; 1-专业版; 2-旗舰版。使用整型代替字符串可节约存储空间并提升查询效率）',
 
     -- 空间配额控制字段 (Quota Fields)
@@ -135,6 +136,7 @@ CREATE TABLE IF NOT EXISTS space
     -- 索引设计 (Indexes)
     INDEX idx_userId (userId)                           COMMENT '普通索引：加速查询某位用户拥有的所有空间列表（个人空间管理核心索引）',
     INDEX idx_spaceName (spaceName)                     COMMENT '普通索引：加速后台管理系统或前端界面按空间名称进行的检索查询',
+    INDEX idx_spaceType (spaceType)                     COMMENT '普通索引：加速按私有空间或团队空间进行筛选',
     INDEX idx_spaceLevel (spaceLevel)                   COMMENT '普通索引：加速后台筛选特定级别的空间，便于进行等级相关的运营统计与批量操作'
 ) COMMENT '图库空间表' COLLATE = utf8mb4_unicode_ci;
 
@@ -150,3 +152,12 @@ ALTER TABLE picture
 -- 补充索引：加速空间内图片的加载与查询
 -- ==========================================
 CREATE INDEX idx_spaceId ON picture (spaceId) COMMENT '普通索引：加速查询特定私有空间下的所有图片列表，大幅提升空间内瀑布流等业务的加载性能';
+
+
+-- ==========================================
+-- 业务变更：补充空间类型（已存在旧表时按需手动执行）
+-- ==========================================
+ ALTER TABLE space
+     ADD COLUMN spaceType INT DEFAULT 0 NOT NULL COMMENT '空间类型：0-私有空间 1-团队空间';
+
+CREATE INDEX idx_spaceType ON space (spaceType);

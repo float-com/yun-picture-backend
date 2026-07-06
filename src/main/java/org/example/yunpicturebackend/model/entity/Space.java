@@ -29,6 +29,11 @@ public class Space {
     private String spaceName;
 
     /**
+     * 空间类型（枚举值：0-私有空间; 1-团队空间。用于区分个人私有图库与后续支持多人协作的团队图库）
+     */
+    private Integer spaceType;
+
+    /**
      * 空间级别（枚举值：0-普通版; 1-专业版; 2-旗舰版。用于区分不同级别的服务权益和配额策略，使用整型可节约存储空间并提升查询效率）
      */
     private Integer spaceLevel;

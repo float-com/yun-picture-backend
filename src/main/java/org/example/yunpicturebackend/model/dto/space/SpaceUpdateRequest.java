@@ -29,6 +29,13 @@ public class SpaceUpdateRequest implements Serializable {
     private String spaceName;
 
     /**
+     * 空间类型
+     * <p>
+     * 作用：管理员调整空间类型（0-私有空间 1-团队空间）。
+     */
+    private Integer spaceType;
+
+    /**
      * 空间级别
      * <p>
      * 作用：管理员手动调整该空间的权益等级（0-普通版 1-专业版 2-旗舰版）。

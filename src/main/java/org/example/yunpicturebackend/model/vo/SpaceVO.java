@@ -6,6 +6,7 @@ import org.springframework.beans.BeanUtils;
 
 import java.io.Serializable;
 import java.util.Date;
+import java.util.List;
 
 /**
  * 图库空间视图对象 (VO)
@@ -29,6 +30,13 @@ public class SpaceVO implements Serializable {
      * 场景：用于前端空间卡片、列表页或详情页的标题展示。
      */
     private String spaceName;
+
+    /**
+     * 空间类型（枚举值：0-私有空间 1-团队空间）
+     * <p>
+     * 场景：前端空间详情页会根据该字段展示当前空间类型，如“私有空间”或“团队空间”。
+     */
+    private Integer spaceType;
 
     /**
      * 空间级别（枚举值：0-普通版 1-专业版 2-旗舰版）
@@ -92,6 +100,13 @@ public class SpaceVO implements Serializable {
      * 将关联的脱敏用户信息一并包装返回，满足空间卡片上展示“拥有者头像 + 昵称”的典型 UI 需求。
      */
     private UserVO user;
+
+    /**
+     * 当前登录用户对该空间拥有的权限列表
+     * <p>
+     * 场景：前端空间详情页会根据该列表控制上传、编辑、删除、成员管理等操作按钮是否展示。
+     */
+    private List<String> permissionList;
 
     /**
      * 序列化版本控制标识

@@ -34,6 +34,17 @@ public interface SpaceService extends IService<Space> {
     long addSpace(SpaceAddRequest spaceAddRequest, User loginUser);
 
     /**
+     * 删除图库空间
+     * <p>
+     * 业务场景：用户或管理员删除空间时，必须同时清理该空间下的图片记录，避免空间删除后遗留无法管理的孤立图片数据。
+     * 核心逻辑：空间记录删除与图片记录删除放在同一个事务中提交，保证数据库层面的状态一致。
+     *
+     * @param spaceId   待删除的空间 ID
+     * @param loginUser 当前已认证的登录用户对象（用于空间归属权限校验）
+     */
+    void deleteSpace(long spaceId, User loginUser);
+
+    /**
      * 构建空间查询的 MyBatis-Plus 包装类 (QueryWrapper)
      * <p>
      * 业务场景：在执行空间的分页查询或列表检索前，将前端传入的 DTO 查询条件转换为数据库可执行的 SQL 条件。
